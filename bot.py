@@ -19,6 +19,8 @@ from telegram.ext import (
     filters,
 )
 
+from worldbooks import DEFAULT_WORLD_BOOKS, WORLD_BOOKS, render_worldbooks
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 LLMHUB_API_KEY = os.environ.get("LLMHUB_API_KEY", "").strip()
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()
@@ -174,16 +176,41 @@ def current_model(chat_id: int) -> str:
     return get_setting(chat_id, "model") or CLAUDE_MODEL
 
 
+def enabled_worldbooks(chat_id: int) -> list[str]:
+    raw = get_setting(chat_id, "worldbooks")
+    if raw is None:
+        return list(DEFAULT_WORLD_BOOKS)
+    try:
+        names = json.loads(raw)
+    except json.JSONDecodeError:
+        return list(DEFAULT_WORLD_BOOKS)
+    if not isinstance(names, list):
+        return list(DEFAULT_WORLD_BOOKS)
+    return [name for name in names if name in WORLD_BOOKS]
+
+
+def save_worldbooks(chat_id: int, names: list[str]) -> None:
+    set_setting(chat_id, "worldbooks", json.dumps(names, ensure_ascii=False))
+
+
 def build_system_prompt(chat_id: int) -> str:
+    blocks = [SYSTEM_PROMPT]
+
+    books = enabled_worldbooks(chat_id)
+    if books:
+        blocks.append(
+            "以下为当前启用的角色扮演世界书。它们用于补充角色表现与文风；若与角色卡冲突，以角色既有人设为准。\n"
+            + render_worldbooks(books)
+        )
+
     memories = list_memories(chat_id, 30)
-    if not memories:
-        return SYSTEM_PROMPT
-    memory_text = "\n".join(f"- {row['text']}" for row in memories)
-    return (
-        f"{SYSTEM_PROMPT}\n\n"
-        "以下是用户明确要求长期记住的信息。只在相关时自然使用，不要每次主动复述：\n"
-        f"{memory_text}"
-    )
+    if memories:
+        memory_text = "\n".join(f"- {row['text']}" for row in memories)
+        blocks.append(
+            "以下是用户明确要求长期记住的信息。只在相关时自然使用，不要每次主动复述：\n"
+            + memory_text
+        )
+    return "\n\n".join(blocks)
 
 
 def split_text(text: str, max_len: int = 3900) -> list[str]:
@@ -431,6 +458,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/reset 清空短期上下文\n"
             "/model 查看/切换模型\n"
             "/models 查看可用模型\n"
+            "/worldbooks 查看世界书\n"
+            "/world on|off 名称 开关世界书\n"
             "/remember 添加长期记忆\n"
             "/memories 查看记忆\n"
             "/stream on|off 控制流式输出\n"
@@ -494,7 +523,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("请先认证。")
         return
     histories[chat_id].clear()
-    await update.message.reply_text("当前短期对话上下文已清空；长期记忆没有删除。")
+    await update.message.reply_text("当前短期对话上下文已清空；长期记忆和世界书设置没有删除。")
 
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -552,6 +581,53 @@ async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("模型列表为空。")
         return
     await safe_reply(update, "可用模型：\n" + "\n".join(f"`{m}`" for m in shown))
+
+
+async def worldbooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    chat_id = update.effective_chat.id
+    if not is_authorized(chat_id):
+        await update.message.reply_text("请先认证。")
+        return
+    enabled = set(enabled_worldbooks(chat_id))
+    lines = ["已安装世界书："]
+    for name, book in WORLD_BOOKS.items():
+        mark = "✅" if name in enabled else "⬜"
+        lines.append(f"{mark} {name} — {book['title']}")
+    lines.append("\n开关示例：/world off 珍藏欲  或  /world on 年上char")
+    await safe_reply(update, "\n".join(lines))
+
+
+async def world_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    chat_id = update.effective_chat.id
+    if not is_authorized(chat_id):
+        await update.message.reply_text("请先认证。")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("用法：/world on 世界书名 或 /world off 世界书名\n发送 /worldbooks 查看名称。")
+        return
+    action = context.args[0].lower()
+    name = " ".join(context.args[1:]).strip()
+    if name not in WORLD_BOOKS:
+        await update.message.reply_text("没有找到这个世界书。发送 /worldbooks 查看已安装列表。")
+        return
+    books = enabled_worldbooks(chat_id)
+    if action == "on":
+        if name not in books:
+            books.append(name)
+        save_worldbooks(chat_id, books)
+        histories[chat_id].clear()
+        await update.message.reply_text(f"已启用世界书：{name} ✅")
+    elif action == "off":
+        books = [item for item in books if item != name]
+        save_worldbooks(chat_id, books)
+        histories[chat_id].clear()
+        await update.message.reply_text(f"已关闭世界书：{name}")
+    else:
+        await update.message.reply_text("用法：/world on 世界书名 或 /world off 世界书名")
 
 
 async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -724,6 +800,8 @@ async def post_init(application) -> None:
             BotCommand("reset", "清空短期上下文"),
             BotCommand("model", "查看或切换模型"),
             BotCommand("models", "查看可用模型"),
+            BotCommand("worldbooks", "查看已安装世界书"),
+            BotCommand("world", "开关世界书"),
             BotCommand("remember", "添加长期记忆"),
             BotCommand("memories", "查看长期记忆"),
             BotCommand("forget", "删除一条长期记忆"),
@@ -752,6 +830,8 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("models", models_command))
+    app.add_handler(CommandHandler("worldbooks", worldbooks_command))
+    app.add_handler(CommandHandler("world", world_command))
     app.add_handler(CommandHandler("remember", remember_command))
     app.add_handler(CommandHandler("memories", memories_command))
     app.add_handler(CommandHandler("forget", forget_command))
@@ -764,7 +844,7 @@ def main() -> None:
 
     print(
         f"Claude Telegram Bot starting with default model={CLAUDE_MODEL}, "
-        f"memory_db={MEMORY_DB_PATH}",
+        f"memory_db={MEMORY_DB_PATH}, worldbooks={DEFAULT_WORLD_BOOKS}",
         flush=True,
     )
     app.run_polling(drop_pending_updates=False)
