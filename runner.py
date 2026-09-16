@@ -1,4 +1,5 @@
 import asyncio
+import random
 import re
 from collections import defaultdict
 
@@ -23,6 +24,9 @@ bot.clear_memories = memory_pg.clear_memories
 
 _active_query: dict[int, str] = {}
 _original_safe_reply = bot.safe_reply
+
+MEMORY_ANALYZER_COUNT_KEY = "memory_analyzer_turn_count"
+MEMORY_ANALYZER_TARGET_KEY = "memory_analyzer_turn_target"
 
 
 def build_system_prompt_pg(chat_id: int) -> str:
@@ -183,6 +187,106 @@ async def bubble_safe_reply(update, text: str) -> None:
 bot.safe_reply = bubble_safe_reply
 
 
+def _get_int_setting(chat_id: int, key: str, default: int = 0) -> int:
+    try:
+        value = memory_pg.get_setting(chat_id, key)
+        return int(value) if value is not None else default
+    except Exception:
+        return default
+
+
+def _set_analyzer_window(chat_id: int) -> None:
+    memory_pg.set_setting(chat_id, MEMORY_ANALYZER_COUNT_KEY, "0")
+    memory_pg.set_setting(chat_id, MEMORY_ANALYZER_TARGET_KEY, str(random.randint(5, 8)))
+
+
+def _looks_memory_worthy(text: str) -> bool:
+    """Cheap local gate: only obvious durable facts or relationship milestones trigger Sonnet immediately."""
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return False
+
+    # Explicit requests to remember or clearly durable personal facts/preferences.
+    durable_patterns = (
+        r"记住(?:这件事|这个|我说的|以后)",
+        r"你要记得",
+        r"别忘(?:了|记)",
+        r"不要忘(?:了|记)",
+        r"以后(?:一直|都|就)叫我",
+        r"以后叫我",
+        r"我的生日(?:是|在)",
+        r"我生日(?:是|在)",
+        r"生日是\d",
+        r"纪念日(?:是|在)",
+        r"我(?:对.+)?过敏",
+        r"我(?:不能|不吃|吃不了).{0,10}(?:因为|会过敏|过敏)",
+        r"我的雷点",
+        r"雷点是",
+        r"我最讨厌",
+        r"我特别讨厌",
+        r"我最怕",
+        r"我特别怕",
+        r"我不喜欢别人",
+        r"我有个习惯",
+        r"我每天都会",
+        r"我一般都会",
+        r"我来自",
+        r"我住在",
+        r"我的工作是",
+        r"我在.+工作",
+        r"我毕业于",
+    )
+
+    # Relationship milestones and promises should also be reflected promptly.
+    relationship_patterns = (
+        r"我答应你",
+        r"你答应我",
+        r"我们约定",
+        r"这是我们的约定",
+        r"我承诺",
+        r"我们(?:正式)?在一起",
+        r"做我(?:男朋友|女朋友|恋人)",
+        r"我们分手",
+        r"分手吧",
+        r"我们复合",
+        r"复合吧",
+        r"我们结婚",
+        r"嫁给我",
+        r"娶我",
+        r"订婚",
+    )
+
+    for pattern in durable_patterns + relationship_patterns:
+        if re.search(pattern, compact, flags=re.I):
+            return True
+
+    # Explicitly framing something as important is a useful signal, but require
+    # enough substance so phrases like “好重要哦” do not cause a call.
+    if len(compact) >= 24 and re.search(r"(?:很重要|重要的事|认真告诉你|一直没告诉你)", compact):
+        return True
+
+    return False
+
+
+def _should_run_memory_analyzer(chat_id: int, user_text: str) -> tuple[bool, str]:
+    count = _get_int_setting(chat_id, MEMORY_ANALYZER_COUNT_KEY, 0) + 1
+    target = _get_int_setting(chat_id, MEMORY_ANALYZER_TARGET_KEY, 0)
+    if target < 5 or target > 8:
+        target = random.randint(5, 8)
+        memory_pg.set_setting(chat_id, MEMORY_ANALYZER_TARGET_KEY, str(target))
+
+    if _looks_memory_worthy(user_text):
+        _set_analyzer_window(chat_id)
+        return True, "event"
+
+    if count >= target:
+        _set_analyzer_window(chat_id)
+        return True, f"periodic_{target}"
+
+    memory_pg.set_setting(chat_id, MEMORY_ANALYZER_COUNT_KEY, str(count))
+    return False, f"skip_{count}_of_{target}"
+
+
 async def handle_text_with_memory(update, context) -> None:
     if not update.message or not update.message.text:
         return
@@ -208,10 +312,16 @@ async def handle_text_with_memory(update, context) -> None:
         if last.get("role") == "assistant" and isinstance(last.get("content"), str):
             assistant_text = last["content"]
 
+    should_analyze, reason = _should_run_memory_analyzer(chat_id, user_text)
+    if not should_analyze:
+        print(f"Memory analyzer skipped: chat_id={chat_id}, reason={reason}", flush=True)
+        return
+
     recent = list(bot.histories[chat_id][-12:])
 
     async def background_store():
         try:
+            print(f"Memory analyzer running: chat_id={chat_id}, reason={reason}", flush=True)
             await memory_pg.analyze_and_store(
                 chat_id=chat_id,
                 telegram_message_id=update.message.message_id,
@@ -296,11 +406,17 @@ async def memory_status_command(update, context) -> None:
     memories = memory_pg.list_memories(chat_id, 200)
     favorites = memory_pg.list_favorites(chat_id, 200)
     relationship = memory_pg.get_relationship(chat_id)
+    count = _get_int_setting(chat_id, MEMORY_ANALYZER_COUNT_KEY, 0)
+    target = _get_int_setting(chat_id, MEMORY_ANALYZER_TARGET_KEY, 0)
+    schedule_text = f"{count}/{target}" if 5 <= target <= 8 else "等待初始化"
     await update.message.reply_text(
         "长期记忆系统 ✅ PostgreSQL 持久化\n"
         f"记忆条目：{len(memories)}\n"
         f"关系摘要：{'有' if relationship else '暂无'}\n"
         f"收藏条目：{len(favorites)}\n"
+        "分析策略：重要事件立即分析 + 每 5-8 轮兜底整理\n"
+        f"当前兜底计数：{schedule_text}\n"
+        "普通消息不会再每条调用记忆模型。\n"
         "重新部署 Bot 不会清空这些数据。"
     )
 
@@ -364,7 +480,7 @@ def main() -> None:
 
     print(
         f"Claude Telegram Bot starting with default model={bot.CLAUDE_MODEL}, "
-        "persistent_memory=PostgreSQL, auto_memory=selective, favorites=on",
+        "persistent_memory=PostgreSQL, auto_memory=event_or_periodic_5_8, favorites=on",
         flush=True,
     )
     app.run_polling(drop_pending_updates=False)
