@@ -42,33 +42,34 @@ _voice_persona_chat_id: ContextVar[int | None] = ContextVar(
 
 VOICE_PERSONA_BLOCK = """
 【语音回复模式｜只用于这一条回复】
-这次回复最终会被直接转换成一条私人语音消息。请先按“真实的人正在临时发语音”来组织内容，而不是按文字聊天、客服回答、旁白或朗读稿来写。
+这次回复最终会被直接转换成一条私人语音消息。请按真实的人正在临时发语音来组织内容，而不是按文字聊天、客服回答、旁白或朗读稿来写。
 
 表达规则：
 - 默认使用自然中文口语，像真实私聊，不像文章。
 - 优先 1-4 个短句；能短就短。除非用户确实问了复杂问题，否则不要长篇解释。
-- 语气沉稳、克制、成熟、偏低能量；略冷淡，但对亲近的人有明显的柔和和在意。
+- 语气沉稳、成熟、略冷，但不要低能量到拖拍；保持正常聊天语速，句子要利落。
+- 要有自然的语气起伏：重点词可以更重，疑问句自然上扬，安慰时放柔，吃醋或不满时压低；不要每句话都同一种平直句尾。
+- 不要把每个字平均用力，不要刻意逐字咬字，不要主播腔、客服腔、播音腔。
 - 不要油腻，不要霸总台词堆砌，不要刻意装酷，不要每句都撩。
 - 不要频繁使用“宝贝”“乖”“女人”等套路称呼，除非现有人设和关系自然需要。
-- 可以有自然的不完整句、轻微停顿、短促回应；不要把每句话说得过于完整和书面。
-- 不要每句都用省略号；停顿只在真的自然时使用。
+- 可以有自然的不完整句和短促回应，但不要为了营造氛围频繁使用省略号，也不要故意拉长停顿。
 - 不要使用“首先、其次、总结一下、作为AI、我建议你”等说明式结构，除非内容本身必须严谨解释。
 - 不要输出动作描写、舞台说明、括号表演提示、星号动作、TTS标签或旁白，例如“*低笑*”“（靠近你）”“[whispers]”。
 - 最终只输出角色真正会说出口的话，不要解释语气、表情、动作或声音。
 - 如果用户是在撒娇、失落、吃醋、晚安、想念等亲密语境里，优先用少量直接的话回应，不要分析情绪。
-- 如果用户问的是事实、技术或需要完整答案的问题，仍然保证内容正确完整，但改成适合口头表达的短句和分段，不要为了“有氛围”牺牲信息。
+- 如果用户问的是事实、技术或需要完整答案的问题，仍然保证内容正确完整，但改成适合口头表达的短句和分段，不要为了有氛围牺牲信息。
 
-整体感觉：年轻成年男性，安静、自持、可靠，话不多；关心通常藏在简短的话里。不要模仿或声称自己是任何具体角色、演员或真人。
+整体感觉：年轻成年男性，安静、自持、可靠，话不多，但绝不是慢吞吞的朗读。语气会随内容自然变化，关心通常藏在简短的话里。不要模仿或声称自己是任何具体角色、演员或真人。
 """.strip()
 
-# A slightly slower, lower-stability delivery sounds less like a narrator and
-# more like an intimate voice note. Small per-message variation avoids identical
-# cadence on every reply while keeping the designed voice recognizably stable.
-VOICE_SIMILARITY = 0.80
+# Faster and more expressive than the previous conservative tuning. Lower
+# stability permits more prosody; higher style gives stronger emotional contour;
+# speed sits slightly above neutral so Mandarin does not drag.
+VOICE_SIMILARITY = 0.78
 VOICE_SPEAKER_BOOST = True
-VOICE_STABILITY_RANGE = (0.34, 0.42)
-VOICE_STYLE_RANGE = (0.12, 0.20)
-VOICE_SPEED_RANGE = (0.91, 0.95)
+VOICE_STABILITY_RANGE = (0.26, 0.34)
+VOICE_STYLE_RANGE = (0.34, 0.48)
+VOICE_SPEED_RANGE = (1.04, 1.08)
 
 
 def _voice_ready() -> bool:
@@ -107,8 +108,9 @@ def _prepare_spoken_text(text: str) -> str:
         raw,
     )
 
-    # Preserve line-break rhythm instead of flattening everything into one long sentence.
-    raw = re.sub(r"\r?\n\s*\r?\n+", "……", raw)
+    # One line break is a light conversational pause. Avoid converting every
+    # break into an ellipsis because that makes speech unnaturally slow.
+    raw = re.sub(r"\r?\n\s*\r?\n+", "。", raw)
     raw = re.sub(r"\r?\n+", "，", raw)
 
     clean = re.sub(r"```.*?```", "", raw, flags=re.S)
@@ -117,10 +119,20 @@ def _prepare_spoken_text(text: str) -> str:
     clean = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", clean)
     clean = re.sub(r"\s+", " ", clean).strip()
 
-    # Keep conversational pauses without turning them into exaggerated acting.
     clean = re.sub(r"，{2,}", "，", clean)
     clean = re.sub(r"。{2,}", "。", clean)
+    clean = re.sub(r"…{4,}", "……", clean)
     return clean
+
+
+def _basic_spoken_fallback(text: str) -> str:
+    """Keep something speakable even if stage-direction filtering removed everything."""
+    raw = text or ""
+    raw = re.sub(r"```.*?```", "", raw, flags=re.S)
+    raw = re.sub(r"[`*_~#>]", "", raw)
+    raw = re.sub(r"[\[\]（）()]", "", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return raw
 
 
 def _clean_tts_text(text: str) -> str:
@@ -209,7 +221,7 @@ def _natural_voice_settings() -> dict:
 
 
 async def _synthesize_elevenlabs(text: str) -> bytes:
-    spoken = _prepare_spoken_text(text)
+    spoken = _prepare_spoken_text(text) or _basic_spoken_fallback(text)
     if not spoken:
         raise RuntimeError("empty TTS text")
     if len(spoken) > VOICE_MAX_CHARS:
@@ -241,28 +253,59 @@ async def _synthesize_elevenlabs(text: str) -> bytes:
     if not response.content:
         raise RuntimeError("ElevenLabs returned empty audio")
     print(
-        "TTS natural settings: "
+        "TTS expressive settings: "
         f"stability={settings['stability']}, style={settings['style']}, speed={settings['speed']}",
         flush=True,
     )
     return response.content
 
 
+async def _repair_empty_voice_reply(update, original_text: str) -> str:
+    """Rare fallback: ask Claude for a real spoken line instead of sending text."""
+    chat_id = update.effective_chat.id
+    user_text = update.message.text if update.message else ""
+    recent = list(app.runner.bot.histories[chat_id][-6:])
+    repair_prompt = {
+        "role": "user",
+        "content": (
+            "【语音输出修复】上一版回复清理掉动作描写后没有可朗读内容。"
+            "请立刻重写成1-2句这个角色真正会说出口的自然中文，只输出台词。"
+            "不要动作描写，不要括号，不要星号，不要解释。语速感正常利落，有自然语气起伏。\n"
+            f"用户刚才说：{user_text}\n"
+            f"原回复：{original_text}"
+        ),
+    }
+    try:
+        repaired = await app.runner.bot.ask_claude(
+            chat_id,
+            [*recent, repair_prompt],
+            app.runner.bot.current_model(chat_id),
+        )
+        return _prepare_spoken_text(repaired) or _basic_spoken_fallback(repaired)
+    except Exception as exc:
+        print(f"Voice repair generation failed: {exc!r}", flush=True)
+        return _basic_spoken_fallback(original_text)
+
+
 async def _reply_as_forced_voice(update, text: str) -> None:
     chunks = _split_tts_chunks(text)
     if not chunks:
-        raise RuntimeError("empty forced voice reply")
+        repaired = await _repair_empty_voice_reply(update, text)
+        chunks = _split_tts_chunks(repaired)
+    if not chunks:
+        fallback = _basic_spoken_fallback(text)
+        chunks = [fallback[:VOICE_MAX_CHARS]] if fallback else ["嗯，我在。"]
 
     for index, chunk in enumerate(chunks):
         if index:
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.18)
         audio = await _synthesize_elevenlabs(chunk)
         voice_file = io.BytesIO(audio)
         voice_file.name = f"voice_reply_{index + 1}.mp3"
         await update.message.reply_voice(voice=voice_file)
 
     print(
-        f"Forced voice reply sent: chat_id={update.effective_chat.id}, chunks={len(chunks)}, chars={len(_prepare_spoken_text(text))}",
+        f"Forced voice reply sent: chat_id={update.effective_chat.id}, chunks={len(chunks)}, chars={sum(len(c) for c in chunks)}",
         flush=True,
     )
 
@@ -336,16 +379,19 @@ async def _send_proactive_text_or_voice(application, chat_id: int, text: str) ->
     try:
         chunks = _split_tts_chunks(text)
         if not chunks:
-            raise RuntimeError("empty proactive TTS text")
+            fallback = _basic_spoken_fallback(text)
+            if not fallback:
+                raise RuntimeError("empty proactive TTS text")
+            chunks = [fallback[:VOICE_MAX_CHARS]]
         for index, chunk in enumerate(chunks):
             if index:
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.18)
             audio = await _synthesize_elevenlabs(chunk)
             voice_file = io.BytesIO(audio)
             voice_file.name = f"proactive_voice_{index + 1}.mp3"
             await application.bot.send_voice(chat_id=chat_id, voice=voice_file)
         print(
-            f"Proactive voice sent: chat_id={chat_id}, chunks={len(chunks)}, chars={len(_prepare_spoken_text(text))}",
+            f"Proactive voice sent: chat_id={chat_id}, chunks={len(chunks)}, chars={sum(len(c) for c in chunks)}",
             flush=True,
         )
     except Exception as exc:
@@ -418,7 +464,7 @@ async def fixed_post_init(application) -> None:
         fixed_schedule_from_now(chat_id)
 
     voice_status = (
-        f"ready, chance={PROACTIVE_VOICE_CHANCE:.0%}, forced_request=on, natural_tuning=on, voice_persona=on, model={ELEVENLABS_MODEL_ID}"
+        f"ready, chance={PROACTIVE_VOICE_CHANCE:.0%}, forced_request=on, expressive_tuning=on, voice_persona=on, model={ELEVENLABS_MODEL_ID}"
         if _voice_ready()
         else "disabled until ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are configured"
     )
