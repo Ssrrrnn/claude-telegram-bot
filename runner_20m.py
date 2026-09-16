@@ -1,4 +1,9 @@
 import asyncio
+import io
+import os
+import re
+
+import httpx
 
 import runner_strict_bubbles as app
 
@@ -6,6 +11,96 @@ import runner_strict_bubbles as app
 # memory, time-awareness, and strict-bubble behavior.
 app.PROACTIVE_MIN_SECONDS = 20 * 60
 app.PROACTIVE_MAX_SECONDS = 60 * 60
+
+# Optional ElevenLabs voice notes for proactive messages.  If the credentials
+# are absent or TTS fails, the bot always falls back to the existing text bubbles.
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
+ELEVENLABS_MODEL_ID = os.environ.get(
+    "ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"
+).strip()
+try:
+    PROACTIVE_VOICE_CHANCE = max(
+        0.0,
+        min(1.0, float(os.environ.get("PROACTIVE_VOICE_CHANCE", "0.25"))),
+    )
+except ValueError:
+    PROACTIVE_VOICE_CHANCE = 0.25
+
+VOICE_MAX_CHARS = 260
+ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
+_original_send_bubbles_to_chat = app._send_bubbles_to_chat
+
+
+def _voice_ready() -> bool:
+    return bool(ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID)
+
+
+def _clean_tts_text(text: str) -> str:
+    clean = re.sub(r"```.*?```", "", text, flags=re.S)
+    clean = re.sub(r"`([^`]*)`", r"\1", clean)
+    clean = re.sub(r"[*_~#>]", "", clean)
+    clean = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
+
+
+async def _synthesize_elevenlabs(text: str) -> bytes:
+    spoken = _clean_tts_text(text)
+    if not spoken:
+        raise RuntimeError("empty TTS text")
+    if len(spoken) > VOICE_MAX_CHARS:
+        raise RuntimeError(f"TTS text too long: {len(spoken)} chars")
+
+    timeout = httpx.Timeout(45.0)
+    url = f"{ELEVENLABS_TTS_URL}/{ELEVENLABS_VOICE_ID}"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+    }
+    payload = {
+        "text": spoken,
+        "model_id": ELEVENLABS_MODEL_ID,
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            url,
+            params={"output_format": "mp3_44100_128"},
+            headers=headers,
+            json=payload,
+        )
+    if response.status_code >= 400:
+        detail = response.text[:500]
+        raise RuntimeError(f"ElevenLabs HTTP {response.status_code}: {detail}")
+    if not response.content:
+        raise RuntimeError("ElevenLabs returned empty audio")
+    return response.content
+
+
+async def _send_proactive_text_or_voice(application, chat_id: int, text: str) -> None:
+    should_voice = _voice_ready() and app.random.random() < PROACTIVE_VOICE_CHANCE
+    if not should_voice:
+        await _original_send_bubbles_to_chat(application, chat_id, text)
+        return
+
+    try:
+        audio = await _synthesize_elevenlabs(text)
+        voice_file = io.BytesIO(audio)
+        voice_file.name = "proactive_voice.mp3"
+        await application.bot.send_voice(chat_id=chat_id, voice=voice_file)
+        print(
+            f"Proactive voice sent: chat_id={chat_id}, chars={len(_clean_tts_text(text))}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"Proactive TTS fallback to text: {exc!r}", flush=True)
+        await _original_send_bubbles_to_chat(application, chat_id, text)
+
+
+# Use the optional voice path only for autonomous/proactive contact.  Normal
+# user-triggered replies remain text so voice notes feel occasional rather than constant.
+app._send_bubbles_to_chat = _send_proactive_text_or_voice
 
 # Quiet hours are 00:30-08:30 Asia/Shanghai.  The previous implementation
 # compared minutes-since-midnight against 30, which accidentally made nearly
@@ -68,9 +163,15 @@ async def fixed_post_init(application) -> None:
     if chat_id is not None and not app._setting(chat_id, app.KEY_NEXT_AT):
         fixed_schedule_from_now(chat_id)
 
+    voice_status = (
+        f"ready, chance={PROACTIVE_VOICE_CHANCE:.0%}, model={ELEVENLABS_MODEL_ID}"
+        if _voice_ready()
+        else "disabled until ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are configured"
+    )
     print(
         "Proactive messaging enabled: interval=20m-60m, daily_max=8, "
-        "quiet=00:30-08:30 Asia/Shanghai; persistent_time_awareness=on",
+        "quiet=00:30-08:30 Asia/Shanghai; persistent_time_awareness=on; "
+        f"voice={voice_status}",
         flush=True,
     )
 
