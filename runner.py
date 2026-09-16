@@ -43,13 +43,13 @@ def build_system_prompt_pg(chat_id: int) -> str:
         )
 
     query = _active_query.get(chat_id, "")
-    memories = memory_pg.relevant_memories(chat_id, query, 14) if query else memory_pg.list_memories(chat_id, 12)
+    memories = memory_pg.relevant_memories(chat_id, query, 8) if query else memory_pg.list_memories(chat_id, 6)
     if memories:
         memory_text = "\n".join(
             f"- [{row.get('kind', 'memory')}] {row['text']}" for row in memories
         )
         blocks.append(
-            "以下是与当前聊天相关的长期记忆。只在相关时自然使用，不要逐条复述，不要声称你在读取记忆库：\n"
+            "以下是与当前聊天真正相关的少量长期记忆。只在确实相关时自然使用，不要逐条复述，不要声称你在读取记忆库，也不要为了体现记忆而强行提起：\n"
             + memory_text
         )
 
@@ -65,8 +65,6 @@ def _looks_like_emoji_only(text: str) -> bool:
     if not stripped:
         return False
 
-    # Remove common emoji code points, variation selectors, joiners, keycaps,
-    # regional indicators and simple ASCII emoticon punctuation.
     leftover = re.sub(
         r"[\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F\u200D\u20E3\u2300-\u23FF\u2B00-\u2BFF0-9#*()（）<>《》\[\]{}:：;；'\".,，。!?！？~～^_^\-—=+\\/|]+",
         "",
@@ -99,9 +97,6 @@ def _split_bubbles(text: str) -> list[str]:
     if text.startswith(structured_prefixes) or "```" in text:
         return [text]
 
-    # Preserve the model's original line boundaries. A standalone emoji line
-    # becomes its own Telegram bubble; prose lines are then split sentence by
-    # sentence so each spoken sentence can feel like a separate chat message.
     raw_lines = [line.strip() for line in re.split(r"\r?\n+", text) if line.strip()]
     if not raw_lines:
         return ["…"]
@@ -123,7 +118,6 @@ def _split_bubbles(text: str) -> list[str]:
             if not sentence:
                 continue
 
-            # If it ends like a complete sentence, send it as its own bubble.
             if re.search(r"[。！？!?….]$", sentence):
                 if pending_fragment:
                     sentence = (pending_fragment + " " + sentence).strip()
@@ -131,8 +125,6 @@ def _split_bubbles(text: str) -> list[str]:
                 bubbles.append(sentence)
                 continue
 
-            # Short fragments without terminal punctuation are allowed to wait
-            # for the next sentence; longer ones are meaningful enough alone.
             if len(sentence) <= 18:
                 if pending_fragment:
                     pending_fragment = (pending_fragment + " " + sentence).strip()
@@ -147,7 +139,6 @@ def _split_bubbles(text: str) -> list[str]:
     if pending_fragment:
         bubbles.append(pending_fragment.strip())
 
-    # Safety split for unexpectedly long bubbles.
     safe_bubbles: list[str] = []
     for bubble in bubbles:
         if len(bubble) <= 700:
@@ -167,8 +158,6 @@ def _split_bubbles(text: str) -> list[str]:
 
     safe_bubbles = [b for b in safe_bubbles if b]
 
-    # Avoid accidental message floods. Keep a generous ceiling for normal
-    # conversational multi-bubble replies and merge only extreme overflow.
     if len(safe_bubbles) > 12:
         safe_bubbles = safe_bubbles[:11] + [" ".join(safe_bubbles[11:])]
 
@@ -184,8 +173,6 @@ async def bubble_safe_reply(update, text: str) -> None:
         return
     for index, bubble in enumerate(bubbles):
         if index:
-            # Small human-like spacing between chat bubbles without making the
-            # conversation feel artificially slow.
             await asyncio.sleep(0.32)
         try:
             await update.message.reply_text(bubble, parse_mode=ParseMode.MARKDOWN)
@@ -221,7 +208,6 @@ async def handle_text_with_memory(update, context) -> None:
         if last.get("role") == "assistant" and isinstance(last.get("content"), str):
             assistant_text = last["content"]
 
-    # Memory analysis happens after the visible reply so it does not slow the chat.
     recent = list(bot.histories[chat_id][-12:])
 
     async def background_store():
@@ -378,7 +364,7 @@ def main() -> None:
 
     print(
         f"Claude Telegram Bot starting with default model={bot.CLAUDE_MODEL}, "
-        "persistent_memory=PostgreSQL, auto_memory=on, favorites=on",
+        "persistent_memory=PostgreSQL, auto_memory=selective, favorites=on",
         flush=True,
     )
     app.run_polling(drop_pending_updates=False)
