@@ -32,18 +32,58 @@ ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
 _original_send_bubbles_to_chat = app._send_bubbles_to_chat
 _original_user_safe_reply = app.runner.bot.safe_reply
 
+# A slightly slower, lower-stability delivery sounds less like a narrator and
+# more like an intimate voice note. Small per-message variation avoids identical
+# cadence on every reply while keeping the designed voice recognizably stable.
+VOICE_SIMILARITY = 0.80
+VOICE_SPEAKER_BOOST = True
+VOICE_STABILITY_RANGE = (0.34, 0.42)
+VOICE_STYLE_RANGE = (0.12, 0.20)
+VOICE_SPEED_RANGE = (0.91, 0.95)
+
 
 def _voice_ready() -> bool:
     return bool(ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID)
 
 
-def _clean_tts_text(text: str) -> str:
-    clean = re.sub(r"```.*?```", "", text, flags=re.S)
+def _looks_like_stage_direction(content: str) -> bool:
+    compact = re.sub(r"\s+", "", content).lower()
+    if not compact or len(compact) > 36:
+        return False
+    hints = (
+        "轻声", "低声", "低笑", "轻笑", "笑", "叹气", "停顿", "沉默", "挑眉", "皱眉",
+        "靠近", "凑近", "看着", "盯着", "摸", "抱", "亲", "吻", "勾唇", "垂眼",
+        "whisper", "sigh", "laugh", "pause", "smile", "looks", "leans", "chuckle",
+    )
+    return any(hint in compact for hint in hints)
+
+
+def _prepare_spoken_text(text: str) -> str:
+    raw = text or ""
+
+    # Do not literally read roleplay actions such as *低笑* or （靠近你） aloud.
+    raw = re.sub(r"\*([^*\n]{1,40})\*", lambda m: "" if _looks_like_stage_direction(m.group(1)) else m.group(1), raw)
+    raw = re.sub(r"（([^）\n]{1,40})）", lambda m: "" if _looks_like_stage_direction(m.group(1)) else m.group(0), raw)
+    raw = re.sub(r"\[([^\]\n]{1,40})\]", lambda m: "" if _looks_like_stage_direction(m.group(1)) else m.group(0), raw)
+
+    # Preserve line-break rhythm instead of flattening everything into one long sentence.
+    raw = re.sub(r"\r?\n\s*\r?\n+", "……", raw)
+    raw = re.sub(r"\r?\n+", "，", raw)
+
+    clean = re.sub(r"```.*?```", "", raw, flags=re.S)
     clean = re.sub(r"`([^`]*)`", r"\1", clean)
     clean = re.sub(r"[*_~#>]", "", clean)
     clean = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", clean)
     clean = re.sub(r"\s+", " ", clean).strip()
+
+    # Keep conversational pauses without turning them into exaggerated acting.
+    clean = re.sub(r"，{2,}", "，", clean)
+    clean = re.sub(r"。{2,}", "。", clean)
     return clean
+
+
+def _clean_tts_text(text: str) -> str:
+    return _prepare_spoken_text(text)
 
 
 def _explicit_voice_request(text: str) -> bool:
@@ -75,7 +115,7 @@ def _explicit_voice_request(text: str) -> bool:
 
 
 def _split_tts_chunks(text: str, max_chars: int = VOICE_MAX_CHARS) -> list[str]:
-    spoken = _clean_tts_text(text)
+    spoken = _prepare_spoken_text(text)
     if not spoken:
         return []
     if len(spoken) <= max_chars:
@@ -93,10 +133,7 @@ def _split_tts_chunks(text: str, max_chars: int = VOICE_MAX_CHARS) -> list[str]:
             if current:
                 chunks.append(current)
                 current = ""
-            chunks.extend(
-                part[i : i + max_chars]
-                for i in range(0, len(part), max_chars)
-            )
+            chunks.extend(part[i : i + max_chars] for i in range(0, len(part), max_chars))
             continue
         if current and len(current) + len(part) > max_chars:
             chunks.append(current)
@@ -108,13 +145,24 @@ def _split_tts_chunks(text: str, max_chars: int = VOICE_MAX_CHARS) -> list[str]:
     return chunks
 
 
+def _natural_voice_settings() -> dict:
+    return {
+        "stability": round(app.random.uniform(*VOICE_STABILITY_RANGE), 2),
+        "similarity_boost": VOICE_SIMILARITY,
+        "style": round(app.random.uniform(*VOICE_STYLE_RANGE), 2),
+        "use_speaker_boost": VOICE_SPEAKER_BOOST,
+        "speed": round(app.random.uniform(*VOICE_SPEED_RANGE), 2),
+    }
+
+
 async def _synthesize_elevenlabs(text: str) -> bytes:
-    spoken = _clean_tts_text(text)
+    spoken = _prepare_spoken_text(text)
     if not spoken:
         raise RuntimeError("empty TTS text")
     if len(spoken) > VOICE_MAX_CHARS:
         raise RuntimeError(f"TTS text too long: {len(spoken)} chars")
 
+    settings = _natural_voice_settings()
     timeout = httpx.Timeout(45.0)
     url = f"{ELEVENLABS_TTS_URL}/{ELEVENLABS_VOICE_ID}"
     headers = {
@@ -125,6 +173,7 @@ async def _synthesize_elevenlabs(text: str) -> bytes:
     payload = {
         "text": spoken,
         "model_id": ELEVENLABS_MODEL_ID,
+        "voice_settings": settings,
     }
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
@@ -138,6 +187,11 @@ async def _synthesize_elevenlabs(text: str) -> bytes:
         raise RuntimeError(f"ElevenLabs HTTP {response.status_code}: {detail}")
     if not response.content:
         raise RuntimeError("ElevenLabs returned empty audio")
+    print(
+        "TTS natural settings: "
+        f"stability={settings['stability']}, style={settings['style']}, speed={settings['speed']}",
+        flush=True,
+    )
     return response.content
 
 
@@ -155,7 +209,7 @@ async def _reply_as_forced_voice(update, text: str) -> None:
         await update.message.reply_voice(voice=voice_file)
 
     print(
-        f"Forced voice reply sent: chat_id={update.effective_chat.id}, chunks={len(chunks)}, chars={len(_clean_tts_text(text))}",
+        f"Forced voice reply sent: chat_id={update.effective_chat.id}, chunks={len(chunks)}, chars={len(_prepare_spoken_text(text))}",
         flush=True,
     )
 
@@ -206,7 +260,7 @@ async def _send_proactive_text_or_voice(application, chat_id: int, text: str) ->
             voice_file.name = f"proactive_voice_{index + 1}.mp3"
             await application.bot.send_voice(chat_id=chat_id, voice=voice_file)
         print(
-            f"Proactive voice sent: chat_id={chat_id}, chunks={len(chunks)}, chars={len(_clean_tts_text(text))}",
+            f"Proactive voice sent: chat_id={chat_id}, chunks={len(chunks)}, chars={len(_prepare_spoken_text(text))}",
             flush=True,
         )
     except Exception as exc:
@@ -279,7 +333,7 @@ async def fixed_post_init(application) -> None:
         fixed_schedule_from_now(chat_id)
 
     voice_status = (
-        f"ready, chance={PROACTIVE_VOICE_CHANCE:.0%}, forced_request=on, model={ELEVENLABS_MODEL_ID}"
+        f"ready, chance={PROACTIVE_VOICE_CHANCE:.0%}, forced_request=on, natural_tuning=on, model={ELEVENLABS_MODEL_ID}"
         if _voice_ready()
         else "disabled until ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are configured"
     )
