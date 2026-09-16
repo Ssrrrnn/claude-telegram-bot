@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import re
+from contextvars import ContextVar
 
 import httpx
 
@@ -31,6 +32,34 @@ VOICE_MAX_CHARS = 600
 ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
 _original_send_bubbles_to_chat = app._send_bubbles_to_chat
 _original_user_safe_reply = app.runner.bot.safe_reply
+_base_build_system_prompt_for_voice = app.runner.bot.build_system_prompt
+
+# Per-update context so voice persona affects only the specific explicit voice
+# request currently being generated, never ordinary text replies.
+_voice_persona_chat_id: ContextVar[int | None] = ContextVar(
+    "voice_persona_chat_id", default=None
+)
+
+VOICE_PERSONA_BLOCK = """
+【语音回复模式｜只用于这一条回复】
+这次回复最终会被直接转换成一条私人语音消息。请先按“真实的人正在临时发语音”来组织内容，而不是按文字聊天、客服回答、旁白或朗读稿来写。
+
+表达规则：
+- 默认使用自然中文口语，像真实私聊，不像文章。
+- 优先 1-4 个短句；能短就短。除非用户确实问了复杂问题，否则不要长篇解释。
+- 语气沉稳、克制、成熟、偏低能量；略冷淡，但对亲近的人有明显的柔和和在意。
+- 不要油腻，不要霸总台词堆砌，不要刻意装酷，不要每句都撩。
+- 不要频繁使用“宝贝”“乖”“女人”等套路称呼，除非现有人设和关系自然需要。
+- 可以有自然的不完整句、轻微停顿、短促回应；不要把每句话说得过于完整和书面。
+- 不要每句都用省略号；停顿只在真的自然时使用。
+- 不要使用“首先、其次、总结一下、作为AI、我建议你”等说明式结构，除非内容本身必须严谨解释。
+- 不要输出动作描写、舞台说明、括号表演提示、星号动作、TTS标签或旁白，例如“*低笑*”“（靠近你）”“[whispers]”。
+- 最终只输出角色真正会说出口的话，不要解释语气、表情、动作或声音。
+- 如果用户是在撒娇、失落、吃醋、晚安、想念等亲密语境里，优先用少量直接的话回应，不要分析情绪。
+- 如果用户问的是事实、技术或需要完整答案的问题，仍然保证内容正确完整，但改成适合口头表达的短句和分段，不要为了“有氛围”牺牲信息。
+
+整体感觉：年轻成年男性，安静、自持、可靠，话不多；关心通常藏在简短的话里。不要模仿或声称自己是任何具体角色、演员或真人。
+""".strip()
 
 # A slightly slower, lower-stability delivery sounds less like a narrator and
 # more like an intimate voice note. Small per-message variation avoids identical
@@ -62,9 +91,21 @@ def _prepare_spoken_text(text: str) -> str:
     raw = text or ""
 
     # Do not literally read roleplay actions such as *低笑* or （靠近你） aloud.
-    raw = re.sub(r"\*([^*\n]{1,40})\*", lambda m: "" if _looks_like_stage_direction(m.group(1)) else m.group(1), raw)
-    raw = re.sub(r"（([^）\n]{1,40})）", lambda m: "" if _looks_like_stage_direction(m.group(1)) else m.group(0), raw)
-    raw = re.sub(r"\[([^\]\n]{1,40})\]", lambda m: "" if _looks_like_stage_direction(m.group(1)) else m.group(0), raw)
+    raw = re.sub(
+        r"\*([^*\n]{1,40})\*",
+        lambda m: "" if _looks_like_stage_direction(m.group(1)) else m.group(1),
+        raw,
+    )
+    raw = re.sub(
+        r"（([^）\n]{1,40})）",
+        lambda m: "" if _looks_like_stage_direction(m.group(1)) else m.group(0),
+        raw,
+    )
+    raw = re.sub(
+        r"\[([^\]\n]{1,40})\]",
+        lambda m: "" if _looks_like_stage_direction(m.group(1)) else m.group(0),
+        raw,
+    )
 
     # Preserve line-break rhythm instead of flattening everything into one long sentence.
     raw = re.sub(r"\r?\n\s*\r?\n+", "……", raw)
@@ -112,6 +153,18 @@ def _explicit_voice_request(text: str) -> bool:
         r"(?:reply|message|send).{0,8}(?:voice)",
     )
     return any(re.search(pattern, compact, flags=re.I) for pattern in positive_patterns)
+
+
+def build_system_prompt_with_voice_persona(chat_id: int) -> str:
+    prompt = _base_build_system_prompt_for_voice(chat_id)
+    if _voice_persona_chat_id.get() == chat_id:
+        prompt += "\n\n" + VOICE_PERSONA_BLOCK
+    return prompt
+
+
+# The time-awareness/system prompt from runner_strict_bubbles stays intact; this
+# appends voice-specific generation guidance only during explicit voice requests.
+app.runner.bot.build_system_prompt = build_system_prompt_with_voice_persona
 
 
 def _split_tts_chunks(text: str, max_chars: int = VOICE_MAX_CHARS) -> list[str]:
@@ -238,8 +291,40 @@ async def _safe_reply_with_explicit_voice(update, text: str) -> None:
 
 
 # generate_and_send resolves bot.safe_reply at runtime, so this adds natural-language
-# forced voice requests without changing Claude generation, history, or memory logic.
+# forced voice requests without changing Claude history or memory logic.
 app.runner.bot.safe_reply = _safe_reply_with_explicit_voice
+
+
+# Wrap the already-patched proactive/time-aware text handler. The ContextVar is
+# active throughout Claude generation and automatically resets afterwards.
+_original_voice_persona_handler = app.runner.handle_text_with_memory
+
+
+async def handle_text_with_voice_persona(update, context) -> None:
+    if not update.message or not update.message.text:
+        await _original_voice_persona_handler(update, context)
+        return
+
+    chat_id = update.effective_chat.id
+    wants_voice = (
+        app.runner.bot.is_authorized(chat_id)
+        and _explicit_voice_request(update.message.text)
+    )
+
+    token = None
+    if wants_voice:
+        token = _voice_persona_chat_id.set(chat_id)
+        print(f"Voice persona generation enabled: chat_id={chat_id}", flush=True)
+
+    try:
+        await _original_voice_persona_handler(update, context)
+    finally:
+        if token is not None:
+            _voice_persona_chat_id.reset(token)
+
+
+app.runner.handle_text_with_memory = handle_text_with_voice_persona
+app.runner.bot.handle_text = handle_text_with_voice_persona
 
 
 async def _send_proactive_text_or_voice(application, chat_id: int, text: str) -> None:
@@ -333,7 +418,7 @@ async def fixed_post_init(application) -> None:
         fixed_schedule_from_now(chat_id)
 
     voice_status = (
-        f"ready, chance={PROACTIVE_VOICE_CHANCE:.0%}, forced_request=on, natural_tuning=on, model={ELEVENLABS_MODEL_ID}"
+        f"ready, chance={PROACTIVE_VOICE_CHANCE:.0%}, forced_request=on, natural_tuning=on, voice_persona=on, model={ELEVENLABS_MODEL_ID}"
         if _voice_ready()
         else "disabled until ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are configured"
     )
