@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+from difflib import SequenceMatcher
 from typing import Any
 
 import httpx
@@ -14,6 +15,7 @@ MEMORY_MODEL = os.environ.get("MEMORY_MODEL", "claude-sonnet-5").strip()
 LLMHUB_BASE_URL = os.environ.get("LLMHUB_BASE_URL", "https://llmhub.uk/v1").rstrip("/")
 LLMHUB_API_KEY = os.environ.get("LLMHUB_API_KEY", "").strip()
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "180"))
+AUTO_MEMORY_COOLDOWN_SECONDS = int(os.environ.get("AUTO_MEMORY_COOLDOWN_SECONDS", "7200"))
 
 
 def _connect():
@@ -307,6 +309,67 @@ def relevant_memories(chat_id: int, query: str, limit: int = 14) -> list[dict[st
     return list(reversed(selected))
 
 
+def _normalize_memory_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", text.lower())
+
+
+def _is_duplicate_memory(chat_id: int, text: str, limit: int = 160) -> bool:
+    candidate = _normalize_memory_text(text)
+    if not candidate:
+        return True
+    candidate_tokens = _tokens(text)
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT text FROM memories
+                WHERE chat_id = %s
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (chat_id, limit),
+            )
+            rows = cur.fetchall()
+
+    for row in rows:
+        existing_text = str(row["text"])
+        existing = _normalize_memory_text(existing_text)
+        if not existing:
+            continue
+        if candidate == existing:
+            return True
+        shorter, longer = sorted((candidate, existing), key=len)
+        if len(shorter) >= 8 and shorter in longer and len(shorter) / max(1, len(longer)) >= 0.72:
+            return True
+        if SequenceMatcher(None, candidate, existing).ratio() >= 0.82:
+            return True
+        existing_tokens = _tokens(existing_text)
+        if candidate_tokens and existing_tokens:
+            union = candidate_tokens | existing_tokens
+            if union and len(candidate_tokens & existing_tokens) / len(union) >= 0.72:
+                return True
+    return False
+
+
+def _seconds_since_last_auto_memory(chat_id: int) -> float | None:
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXTRACT(EPOCH FROM (NOW() - created_at)) AS age_seconds
+                FROM memories
+                WHERE chat_id = %s AND kind <> 'manual'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (chat_id,),
+            )
+            row = cur.fetchone()
+    if not row or row["age_seconds"] is None:
+        return None
+    return float(row["age_seconds"])
+
+
 def _extract_json(text: str) -> dict[str, Any] | None:
     text = text.strip()
     if text.startswith("```"):
@@ -372,16 +435,20 @@ async def analyze_and_store(
             compact_history.append({"role": role, "content": content[:1200]})
 
     system = """你是聊天应用后台的记忆整理器，不参与角色扮演正文。只返回严格 JSON，不要 Markdown，不要解释，不要推理过程。
-目标：从当前一轮聊天里提取值得跨天、跨会话保留的信息，并维护关系状态；同时判断用户当前消息是否值得由角色真实收藏。
+目标：极其克制地保存真正值得跨天、跨会话甚至数周后继续使用的信息，并维护关系状态；同时判断用户当前消息是否值得由角色真实收藏。
 
-记忆规则：
-- 只保存未来有用、稳定或具有纪念意义的信息：用户偏好/雷点/身份信息、固定称呼、重要约定、关系进展、矛盾和和好、重要事件、反复出现的习惯。
-- 不保存普通寒暄、一次性问题、系统/命令/世界书元信息。
-- 每轮最多 3 条 memory；尽量写成独立、简洁、以后读得懂的事实。
+长期记忆规则（必须严格）：
+- 默认不要新增 memory。只有这条信息在几天或几周后仍会明显影响角色如何回应用户时，才考虑保存。
+- 每轮最多 1 条 memory，绝大多数普通聊天应返回空数组 []。
+- 只保存稳定且高价值的信息：明确且长期的用户偏好/雷点、稳定身份事实、固定称呼、重要且持续有效的约定、重大关系进展、重要共同事件、反复出现且已形成稳定模式的习惯。
+- 不保存：普通寒暄、撒娇、调情、一次性的情绪、当下动作、临时计划、普通甜言蜜语、一次性问题、当天琐事、角色自己的即时感受、已经写进 relationship_state 的短期关系情绪、系统/命令/世界书/模型/测试等元信息。
+- 不要因为“听起来有感情”就保存；不要推断用户没明确表达的事实。
+- 如果和已有长期记忆只是同义改写、补充很小的细节或重复确认，返回空数组，不要新增。
 - kind 仅允许 fact、preference、promise、event、relationship。
-- importance 0-3，3 表示长期关键。
+- importance 只使用 2 或 3：2=稳定且未来有用，3=长期关键/重大里程碑。不要输出 0 或 1。
+- 拿不准就不记。
 
-关系状态：relationship_state 返回“完整更新后的关系摘要”，不是只写本轮变化。应简洁记录关系阶段、当前情绪余波、重要共同经历、固定称呼/相处模式；如果本轮没有任何值得改变的内容，返回 null。
+关系状态：relationship_state 返回“完整更新后的关系摘要”，不是只写本轮变化。它可以比长期 memory 更灵活地承接当前关系阶段、情绪余波和相处模式。若本轮没有值得改变关系摘要的内容，返回 null。不要为了更新而更新。
 
 收藏规则：
 - favorite 只针对用户当前这条原消息。只有它让角色真心喜欢、心软、心动、觉得可爱、感到被偏爱/信任、构成重要约定或纪念瞬间时才为 true。
@@ -408,7 +475,7 @@ JSON 格式：
 
     memories = result.get("memories")
     if isinstance(memories, list):
-        for item in memories[:3]:
+        for item in memories[:1]:
             if not isinstance(item, dict):
                 continue
             text = str(item.get("text") or "").strip()
@@ -416,17 +483,28 @@ JSON 格式：
             if kind not in {"fact", "preference", "promise", "event", "relationship"}:
                 kind = "fact"
             try:
-                importance = int(item.get("importance", 1))
+                importance = int(item.get("importance", 2))
             except Exception:
-                importance = 1
-            if 3 <= len(text) <= 1200:
-                add_memory(
-                    chat_id,
-                    text,
-                    kind=kind,
-                    importance=max(0, min(importance, 3)),
-                    source_message_id=telegram_message_id,
-                )
+                importance = 2
+
+            if importance < 2 or not (6 <= len(text) <= 900):
+                continue
+            importance = min(importance, 3)
+
+            if _is_duplicate_memory(chat_id, text):
+                continue
+
+            age = _seconds_since_last_auto_memory(chat_id)
+            if importance < 3 and age is not None and age < AUTO_MEMORY_COOLDOWN_SECONDS:
+                continue
+
+            add_memory(
+                chat_id,
+                text,
+                kind=kind,
+                importance=importance,
+                source_message_id=telegram_message_id,
+            )
 
     relationship = result.get("relationship_state")
     if isinstance(relationship, str) and relationship.strip().lower() not in {"null", "none"}:
