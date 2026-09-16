@@ -59,6 +59,29 @@ def build_system_prompt_pg(chat_id: int) -> str:
 bot.build_system_prompt = build_system_prompt_pg
 
 
+def _looks_like_emoji_only(text: str) -> bool:
+    """Best-effort check for a line that is basically just emoji/emoticons."""
+    stripped = re.sub(r"\s+", "", text)
+    if not stripped:
+        return False
+
+    # Remove common emoji code points, variation selectors, joiners, keycaps,
+    # regional indicators and simple ASCII emoticon punctuation.
+    leftover = re.sub(
+        r"[\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F\u200D\u20E3\u2300-\u23FF\u2B00-\u2BFF0-9#*()（）<>《》\[\]{}:：;；'\".,，。!?！？~～^_^\-—=+\\/|]+",
+        "",
+        stripped,
+    )
+    return leftover == ""
+
+
+def _split_sentences_preserving_text(text: str) -> list[str]:
+    """Split prose into one sentence per bubble without flattening line breaks."""
+    parts = re.split(r"(?<=[。！？!?…])\s*|(?<=[.!?])\s+", text.strip())
+    parts = [part.strip() for part in parts if part and part.strip()]
+    return parts or ([text.strip()] if text.strip() else [])
+
+
 def _split_bubbles(text: str) -> list[str]:
     if not text:
         return ["…"]
@@ -76,53 +99,80 @@ def _split_bubbles(text: str) -> list[str]:
     if text.startswith(structured_prefixes) or "```" in text:
         return [text]
 
-    normalized = re.sub(r"\s*\n+\s*", " ", text).strip()
-    normalized = re.sub(r"[ \t]{2,}", " ", normalized)
-    if not normalized:
+    # Preserve the model's original line boundaries. A standalone emoji line
+    # becomes its own Telegram bubble; prose lines are then split sentence by
+    # sentence so each spoken sentence can feel like a separate chat message.
+    raw_lines = [line.strip() for line in re.split(r"\r?\n+", text) if line.strip()]
+    if not raw_lines:
         return ["…"]
 
-    sentences = re.split(r"(?<=[。！？!?])\s*|(?<=[.!?])\s+", normalized)
-    sentences = [s.strip() for s in sentences if s and s.strip()]
-    if not sentences:
-        sentences = [normalized]
-
     bubbles: list[str] = []
-    current: list[str] = []
-    current_len = 0
-    for sentence in sentences:
-        sentence_len = len(sentence)
-        if current and (len(current) >= 2 or current_len + sentence_len > 260):
-            bubbles.append(" ".join(current).strip())
-            current = []
-            current_len = 0
+    pending_fragment = ""
 
-        if sentence_len > 520 and not current:
-            pieces = re.split(r"(?<=[，,；;])\s*", sentence)
-            piece_group: list[str] = []
-            piece_len = 0
-            for piece in pieces:
-                if not piece:
-                    continue
-                if piece_group and piece_len + len(piece) > 300:
-                    bubbles.append("".join(piece_group).strip())
-                    piece_group = []
-                    piece_len = 0
-                piece_group.append(piece)
-                piece_len += len(piece)
-            if piece_group:
-                bubbles.append("".join(piece_group).strip())
+    for line in raw_lines:
+        if _looks_like_emoji_only(line):
+            if pending_fragment:
+                bubbles.append(pending_fragment.strip())
+                pending_fragment = ""
+            bubbles.append(line)
             continue
 
-        current.append(sentence)
-        current_len += sentence_len
+        sentences = _split_sentences_preserving_text(line)
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
 
-    if current:
-        bubbles.append(" ".join(current).strip())
+            # If it ends like a complete sentence, send it as its own bubble.
+            if re.search(r"[。！？!?….]$", sentence):
+                if pending_fragment:
+                    sentence = (pending_fragment + " " + sentence).strip()
+                    pending_fragment = ""
+                bubbles.append(sentence)
+                continue
 
-    bubbles = [b for b in bubbles if b]
-    if len(bubbles) > 8:
-        bubbles = bubbles[:7] + [" ".join(bubbles[7:])]
-    return bubbles or [normalized]
+            # Short fragments without terminal punctuation are allowed to wait
+            # for the next sentence; longer ones are meaningful enough alone.
+            if len(sentence) <= 18:
+                if pending_fragment:
+                    pending_fragment = (pending_fragment + " " + sentence).strip()
+                else:
+                    pending_fragment = sentence
+            else:
+                if pending_fragment:
+                    bubbles.append(pending_fragment.strip())
+                    pending_fragment = ""
+                bubbles.append(sentence)
+
+    if pending_fragment:
+        bubbles.append(pending_fragment.strip())
+
+    # Safety split for unexpectedly long bubbles.
+    safe_bubbles: list[str] = []
+    for bubble in bubbles:
+        if len(bubble) <= 700:
+            safe_bubbles.append(bubble)
+            continue
+        chunks = re.split(r"(?<=[，,；;])\s*", bubble)
+        current = ""
+        for chunk in chunks:
+            if not chunk:
+                continue
+            if current and len(current) + len(chunk) > 420:
+                safe_bubbles.append(current.strip())
+                current = ""
+            current += chunk
+        if current:
+            safe_bubbles.append(current.strip())
+
+    safe_bubbles = [b for b in safe_bubbles if b]
+
+    # Avoid accidental message floods. Keep a generous ceiling for normal
+    # conversational multi-bubble replies and merge only extreme overflow.
+    if len(safe_bubbles) > 12:
+        safe_bubbles = safe_bubbles[:11] + [" ".join(safe_bubbles[11:])]
+
+    return safe_bubbles or [text.strip()]
 
 
 async def bubble_safe_reply(update, text: str) -> None:
@@ -134,7 +184,9 @@ async def bubble_safe_reply(update, text: str) -> None:
         return
     for index, bubble in enumerate(bubbles):
         if index:
-            await asyncio.sleep(0.22)
+            # Small human-like spacing between chat bubbles without making the
+            # conversation feel artificially slow.
+            await asyncio.sleep(0.32)
         try:
             await update.message.reply_text(bubble, parse_mode=ParseMode.MARKDOWN)
         except Exception:
