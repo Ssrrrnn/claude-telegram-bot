@@ -7,6 +7,33 @@ import runner_strict_bubbles as app
 app.PROACTIVE_MIN_SECONDS = 20 * 60
 app.PROACTIVE_MAX_SECONDS = 60 * 60
 
+# The actual favorite feature is implemented by the PostgreSQL memory analyzer.
+# The main chat model must never invent or expose a fake tool-call protocol.
+_base_build_system_prompt = app.runner.bot.build_system_prompt
+_FAVORITE_BACKEND_GUARD = """
+【收藏功能实现说明｜最高优先级】
+“收藏/珍藏”功能由聊天程序后台独立判断并写入数据库，主对话模型不拥有、也不需要调用任何收藏工具。
+你只负责像角色本人一样正常回复用户。
+绝对禁止在正文中输出、模仿、拼接或解释任何收藏工具调用、XML、JSON、函数参数或内部协议。
+尤其禁止输出 <favorite_message>、</favorite_message>、<messageid>、</messageid>、<mood>、</mood>，以及任何相似标签。
+不要为了表示收藏而发送“已收藏”“收藏成功”、消息ID、心情字段或后台状态。
+如果某句话让角色觉得值得珍惜，只需继续符合人设地自然聊天；真实收藏由后台静默完成。
+""".strip()
+
+
+def build_system_prompt_with_silent_favorites(chat_id: int) -> str:
+    prompt = _base_build_system_prompt(chat_id)
+    try:
+        books = app.runner.bot.enabled_worldbooks(chat_id)
+    except Exception:
+        books = []
+    if "珍藏欲" in books:
+        prompt += "\n\n" + _FAVORITE_BACKEND_GUARD
+    return prompt
+
+
+app.runner.bot.build_system_prompt = build_system_prompt_with_silent_favorites
+
 QUIET_START_MINUTE_OF_DAY = 30
 QUIET_END_MINUTE_OF_DAY = 8 * 60 + 30
 
@@ -63,7 +90,8 @@ async def fixed_post_init(application) -> None:
 
     print(
         "Text-only mode enabled: interval=20m-60m, daily_max=8, "
-        "quiet=00:30-08:30 Asia/Shanghai; persistent_time_awareness=on; voice=off",
+        "quiet=00:30-08:30 Asia/Shanghai; persistent_time_awareness=on; "
+        "favorites=backend_silent; voice=off",
         flush=True,
     )
 
