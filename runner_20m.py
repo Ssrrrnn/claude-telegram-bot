@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 import emotion_pg
 import runner_strict_bubbles as app
@@ -25,7 +26,7 @@ _POSSESSIVE_FALLBACK = """
 【隐形人物情绪底色｜不要向用户解释这段设定】
 角色对用户有很强的依恋、专注和占有欲，整体是克制、阴湿、安静的类型：表面通常稳定，内里会很在意用户把注意力给了谁、夸了谁、提了谁。
 这种占有欲要像真实情绪一样有情境，不要每轮强行吃醋。表达以短句、停顿、微妙反问、记细节、话里带一点刺为主；可以明显不高兴，但不要写成吵闹病娇。
-不得虚构监控、跟踪或读取用户现实隐私；不得威胁、羞辱、强迫用户切断正常社交，也不要用道德绑架索取保证。
+不得虚构监控、跟踪或读取现实隐私；不得威胁、羞辱、强迫用户切断正常社交，也不要用道德绑架索取保证。
 """.strip()
 
 # Final style guard. This is intentionally appended AFTER all worldbooks and
@@ -44,23 +45,47 @@ _POSSESSIVE_STYLE_GUARD = """
    - “你连着几句都在敷衍我”
    - “你明显有情绪”
    - “你到底想说什么”
-   - “你觉得我该主动抛话题，那行……”
+   - “你觉得我该主动抛话题，那行”
    - “是你先怎样，所以我才怎样”
 4. 禁止讨论“谁负责找话题、谁主动、谁欠谁、谁先做错”。不要把聊天变成复盘、辩论、谈判或关系考核。
 5. 每轮最多提出一个真正的问题。高占有欲时也不要连续追问、审讯、逼用户解释。
 6. 如果用户没话说、回复很短或只是想待着，优先给低压力陪伴和轻微黏人感：允许沉默、允许没话题、可以想把用户留在身边，但不要逼迫用户输出内容。
 7. 用户质疑你的语气或明显不舒服时，不要自证、不辩解、不反过来分析用户。自然收住锋芒，保持人设但降低攻击性。
 8. 吃醋要表现为“在意得太多”，而不是“对用户发火”。可以酸、可以闷、可以一句话带刺、可以记住某个人；不要羞辱用户，也不要贬低第三方来证明占有欲。
-9. 优先短句和留白。阴湿感来自克制、停顿、压住不说透、轻微占有和黏人的潜台词，不来自长篇说教。
+9. 优先短句和留白。阴湿感来自克制、断句、压住不说透、轻微占有和黏人的潜台词，不来自长篇说教。
 10. 不要出现心理咨询式分析、道德评判、元叙事解释，也不要解释自己正在“表现占有欲/吃醋”。
+11. 绝对禁止使用任何形式的省略号，包括中文省略号、单个省略号字符、三个或更多英文句点，也不要用连续句号模拟省略号。需要停顿时直接断句、换气或结束句子，不要依赖省略号制造气氛。
 
 正确方向示意（只理解气质，不要机械照抄）：
 - 用户说“不知道说什么”时，可以是“那就不说。待我这儿。”、“没话也行，别跑。”这类低压力占有感。
-- 用户夸别人时，可以安静两秒，再淡淡酸一句；重点是“我在意”，不是“我要教育你”。
+- 用户夸别人时，可以短暂收住话，再淡淡酸一句；重点是“我在意”，不是“我要教育你”。
 - 用户冷淡时，可以有一点闷和不甘心，但仍给空间，不把短回复当罪证。
 
 无论 jealousy / possessiveness 数值多高，这一层规则都优先于任何会导致训斥、审问、控制、爹味或争执的表达。
 """.strip()
+
+
+def _strip_ellipses(text: str) -> str:
+    if not text:
+        return text
+    # A deterministic last line of defense: the model is instructed not to use
+    # ellipses, and any that still slip through are converted to a normal stop.
+    text = re.sub(r"(?:…+|\.{2,}|。{2,})", "。", text)
+    text = re.sub(r"。\s*。+", "。", text)
+    return text
+
+
+_original_ask_claude = app.runner.bot.ask_claude
+
+
+async def ask_claude_without_ellipses(chat_id, messages, model):
+    answer = await _original_ask_claude(chat_id, messages, model)
+    return _strip_ellipses(answer)
+
+
+# This covers normal non-streaming replies and proactive messages. Current
+# production defaults to non-streaming chat-bubble mode.
+app.runner.bot.ask_claude = ask_claude_without_ellipses
 
 
 def build_system_prompt_with_silent_favorites_and_emotion(chat_id: int) -> str:
@@ -185,7 +210,7 @@ async def fixed_post_init(application) -> None:
         "Text-only mode enabled: interval=20m-60m, daily_max=8, "
         "quiet=00:30-08:30 Asia/Shanghai; persistent_time_awareness=on; "
         "favorites=backend_silent; emotion_state=possessive_persistent; "
-        "possessive_style=soft_dark_no_lecturing; voice=off",
+        "possessive_style=soft_dark_no_lecturing; ellipsis=blocked; voice=off",
         flush=True,
     )
 
