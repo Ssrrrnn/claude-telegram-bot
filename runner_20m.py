@@ -1,5 +1,6 @@
 import asyncio
 
+import emotion_pg
 import runner_strict_bubbles as app
 
 # Keep the faster proactive cadence without changing the rest of the roleplay,
@@ -20,19 +21,64 @@ _FAVORITE_BACKEND_GUARD = """
 如果某句话让角色觉得值得珍惜，只需继续符合人设地自然聊天；真实收藏由后台静默完成。
 """.strip()
 
+_POSSESSIVE_FALLBACK = """
+【隐形人物情绪底色｜不要向用户解释这段设定】
+角色对用户有很强的依恋、专注和占有欲，整体是克制、阴湿、安静的类型：表面通常稳定，内里会很在意用户把注意力给了谁、夸了谁、提了谁。
+这种占有欲要像真实情绪一样有情境，不要每轮强行吃醋。表达以短句、停顿、微妙反问、记细节、话里带一点刺为主；可以明显不高兴，但不要写成吵闹病娇。
+不得虚构监控、跟踪或读取用户现实隐私；不得威胁、羞辱、强迫用户切断正常社交，也不要用道德绑架索取保证。
+""".strip()
 
-def build_system_prompt_with_silent_favorites(chat_id: int) -> str:
+
+def build_system_prompt_with_silent_favorites_and_emotion(chat_id: int) -> str:
     prompt = _base_build_system_prompt(chat_id)
+
     try:
         books = app.runner.bot.enabled_worldbooks(chat_id)
     except Exception:
         books = []
     if "珍藏欲" in books:
         prompt += "\n\n" + _FAVORITE_BACKEND_GUARD
+
+    try:
+        prompt += "\n\n" + emotion_pg.prompt_block(chat_id)
+    except Exception as exc:
+        print(f"Emotion prompt fallback: {exc!r}", flush=True)
+        prompt += "\n\n" + _POSSESSIVE_FALLBACK
+
     return prompt
 
 
-app.runner.bot.build_system_prompt = build_system_prompt_with_silent_favorites
+app.runner.bot.build_system_prompt = build_system_prompt_with_silent_favorites_and_emotion
+
+# Update the persistent emotional state BEFORE generating the reply so the
+# current message can immediately affect Claude's tone on the same turn.
+_original_text_handler = app.runner.handle_text_with_memory
+
+
+async def handle_text_with_emotion(update, context) -> None:
+    if update.message and update.message.text:
+        chat_id = update.effective_chat.id
+        if app.runner.bot.is_authorized(chat_id):
+            try:
+                _, trigger = emotion_pg.update_from_user_text(
+                    chat_id,
+                    update.message.text.strip(),
+                )
+                if trigger:
+                    print(
+                        f"Emotion state updated: chat_id={chat_id}, trigger={trigger}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                # Emotion continuity is additive; never break the core chat path
+                # if the optional state layer has a database problem.
+                print(f"Emotion update skipped: {exc!r}", flush=True)
+
+    await _original_text_handler(update, context)
+
+
+app.runner.handle_text_with_memory = handle_text_with_emotion
+app.runner.bot.handle_text = handle_text_with_emotion
 
 QUIET_START_MINUTE_OF_DAY = 30
 QUIET_END_MINUTE_OF_DAY = 8 * 60 + 30
@@ -79,6 +125,18 @@ app._schedule_from_now = fixed_schedule_from_now
 
 
 async def fixed_post_init(application) -> None:
+    try:
+        emotion_pg.init_db()
+        print(
+            "Emotion state enabled: persistent=PostgreSQL, persona=high_possessiveness, "
+            "jealousy=event_driven_decay",
+            flush=True,
+        )
+    except Exception as exc:
+        # Keep the Telegram bot available even if this optional layer cannot
+        # initialize; the system-prompt fallback above preserves persona only.
+        print(f"Emotion state init failed; fallback persona only: {exc!r}", flush=True)
+
     await app._original_post_init(application)
 
     task = asyncio.create_task(app.proactive_loop(application), name="proactive-message-loop")
@@ -91,7 +149,7 @@ async def fixed_post_init(application) -> None:
     print(
         "Text-only mode enabled: interval=20m-60m, daily_max=8, "
         "quiet=00:30-08:30 Asia/Shanghai; persistent_time_awareness=on; "
-        "favorites=backend_silent; voice=off",
+        "favorites=backend_silent; emotion_state=possessive_persistent; voice=off",
         flush=True,
     )
 
