@@ -1,13 +1,12 @@
 import asyncio
-import random
+import json
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from telegram.constants import ParseMode
-
 import runner
+import proactive_policy as policy
 
 
 # -----------------------------
@@ -78,9 +77,8 @@ runner._split_bubbles = strict_split_bubbles
 # Randomized proactive relationship messages
 # ------------------------------------------
 
-PROACTIVE_MIN_SECONDS = 50 * 60
-PROACTIVE_MAX_SECONDS = 3 * 60 * 60
-PROACTIVE_DAILY_MAX = 8
+PROACTIVE_MIN_SECONDS = policy.MIN_SECONDS
+PROACTIVE_MAX_SECONDS = policy.MAX_SECONDS
 PROACTIVE_TZ = ZoneInfo("Asia/Shanghai")
 QUIET_START_MINUTE = 30          # 00:30
 QUIET_END_HOUR = 8               # 08:30
@@ -90,8 +88,7 @@ KEY_NEXT_AT = "proactive_next_at"
 KEY_LAST_USER_AT = "proactive_last_user_at"
 KEY_LAST_PROACTIVE_AT = "proactive_last_bot_at"
 KEY_LAST_INTERACTION_AT = "last_interaction_at"
-KEY_DAY = "proactive_day"
-KEY_DAY_COUNT = "proactive_day_count"
+KEY_STATE = "proactive_state_v2"
 KEY_ENABLED = "proactive_enabled"
 
 # Per-request time context. It is only present while generating the reply for
@@ -126,55 +123,33 @@ def _now_local() -> datetime:
     return datetime.now(PROACTIVE_TZ)
 
 
-def _today_key() -> str:
-    return _now_local().date().isoformat()
+def _is_quiet_time(dt=None):
+    return policy.is_quiet(dt or _now_local())
 
 
-def _random_delay() -> int:
-    return random.randint(PROACTIVE_MIN_SECONDS, PROACTIVE_MAX_SECONDS)
+def _next_after_quiet(now_local=None):
+    return policy.after_quiet(now_local or _now_local()).timestamp()
 
 
-def _is_quiet_time(dt: datetime | None = None) -> bool:
-    dt = dt or _now_local()
-    minutes = dt.hour * 60 + dt.minute
-    return minutes < (QUIET_END_HOUR * 60 + QUIET_END_MINUTE) or minutes >= QUIET_START_MINUTE
+def _load_state(chat_id):
+    # Fail closed on storage errors instead of sending with missing history.
+    raw = runner.memory_pg.get_setting(chat_id, KEY_STATE)
+    return json.loads(raw) if raw else {
+        "last_proactive_content": "", "last_proactive_type": "",
+        "user_replied_after_proactive": True, "silence_count": 0,
+        "recent": [],
+    }
 
 
-def _next_after_quiet(now_local: datetime | None = None) -> float:
-    now_local = now_local or _now_local()
-    target = now_local.replace(
-        hour=QUIET_END_HOUR,
-        minute=QUIET_END_MINUTE,
-        second=0,
-        microsecond=0,
-    )
-    if now_local.hour * 60 + now_local.minute >= QUIET_START_MINUTE:
-        target += timedelta(days=1)
-    target += timedelta(minutes=random.randint(0, 25))
-    return target.timestamp()
+def _save_state(chat_id, state):
+    runner.memory_pg.set_setting(chat_id, KEY_STATE, json.dumps(state, ensure_ascii=False))
 
 
-def _ensure_daily_counter(chat_id: int) -> int:
-    today = _today_key()
-    stored_day = _setting(chat_id, KEY_DAY)
-    if stored_day != today:
-        _set_setting(chat_id, KEY_DAY, today)
-        _set_setting(chat_id, KEY_DAY_COUNT, "0")
-        return 0
-    try:
-        return max(0, int(_setting(chat_id, KEY_DAY_COUNT, "0")))
-    except ValueError:
-        _set_setting(chat_id, KEY_DAY_COUNT, "0")
-        return 0
-
-
-def _schedule_from_now(chat_id: int) -> None:
-    now = time.time()
-    next_at = now + _random_delay()
-    local_due = datetime.fromtimestamp(next_at, PROACTIVE_TZ)
-    if _is_quiet_time(local_due):
-        next_at = _next_after_quiet(local_due)
-    _set_setting(chat_id, KEY_NEXT_AT, str(int(next_at)))
+def _schedule_from_now(chat_id):
+    state = _load_state(chat_id)
+    due = policy.next_due(_now_local(), state["silence_count"])
+    runner.memory_pg.set_setting(chat_id, KEY_NEXT_AT, str(int(due.timestamp())))
+    print(f"Proactive scheduled: chat_id={chat_id}, due={due.isoformat()}, silence={state['silence_count']}", flush=True)
 
 
 def _owner_chat_id() -> int | None:
@@ -298,111 +273,112 @@ def build_system_prompt_with_time(chat_id: int) -> str:
 runner.bot.build_system_prompt = build_system_prompt_with_time
 
 
-async def _send_bubbles_to_chat(application, chat_id: int, text: str) -> None:
-    bubbles = strict_split_bubbles(text)
-    for index, bubble in enumerate(bubbles):
+async def _send_bubbles_to_chat(application, chat_id, text):
+    # Plain text avoids retrying a possibly delivered message after a timeout.
+    for index, bubble in enumerate(strict_split_bubbles(text)):
         if index:
             await asyncio.sleep(0.32)
-        try:
-            await application.bot.send_message(
-                chat_id=chat_id,
-                text=bubble,
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            await application.bot.send_message(chat_id=chat_id, text=bubble)
+        await application.bot.send_message(chat_id=chat_id, text=bubble)
 
 
-async def _generate_proactive_message(chat_id: int) -> str:
+async def _generate_proactive_message(chat_id, state):
     recent = list(runner.bot.histories[chat_id][-8:])
-    trigger = {
-        "role": "user",
-        "content": (
-            "【后台主动联系事件，不是用户发送的消息】\n"
-            "现在请以当前角色本人主动给用户发消息。不要提到后台、系统、提醒、定时、任务或这段指令。"
-            "结合你们已有的关系状态、长期记忆、时间感知和最近聊天，自然地表现为你自己突然想起对方、想找对方说话。"
-            "如果距离上次联系很久，可以自然体现久别感；如果其实刚聊过不久，就不要假装久别。"
-            "不要每次都问‘在干嘛’，不要固定模板，不要解释为什么联系。可以想念、嘴硬、吃醋、惦记、分享一个念头、"
-            "接上之前没说完的话，或只是很短地叫对方。语气必须符合当前角色和关系阶段。"
-            "优先1-3句短消息；可以偶尔单独用一个emoji，但不要每次都有。不要写大段动作描写。"
-        ),
-    }
-    messages = [*recent, trigger]
-    return await runner.bot.ask_claude(
-        chat_id,
-        messages,
-        runner.bot.current_model(chat_id),
+    sent = state["recent"][-12:]
+    kind = policy.choose_type(_now_local(), [x["type"] for x in sent], state["silence_count"])
+    trigger = (
+        "【后台主动联系事件，不是用户发送的消息】\n"
+        "以当前角色本人主动联系，不提后台、提醒、定时或这段指令。保持既有人格。"
+        f"本次方向：{kind}。连续未回复的主动联系次数：{state['silence_count']}。"
+        "结合真实聊天、记忆和当前北京时间写1至3句短消息。"
+        "沉默不等于新的回复，不要假装用户回答了，也不要重复追问忙不忙、在干嘛。"
+        "未回复时换一个独立话题、分享一个念头或自然表达想念，不催促、不责备、不升级施压。"
+        "吃醋只能基于已发生的话题，没有依据时改为想念，不能把未回复当作吃醋依据。"
+        "分享可以是想法，不要编造真实天气、定位、用户行踪或外部事实。"
+        "白天不能因为疲惫就劝睡，也不要沿用历史消息里的时段。"
+        "以下是已经发过的消息，只用于避重，禁止照抄或近义改写：\n"
+        + json.dumps(sent, ensure_ascii=False)
     )
+    previous = [x["content"] for x in sent]
+    for attempt in range(3):
+        instruction = trigger
+        if attempt:
+            instruction += "\n上一次候选内容重复，请换主题和句式，不能只换几个字。"
+        text = await runner.bot.ask_claude(
+            chat_id, [*recent, {"role": "user", "content": instruction}],
+            runner.bot.current_model(chat_id),
+        )
+        if text and not policy.is_repetition(text, previous):
+            return text.strip(), kind
+        if text:
+            previous.append(text)
+    # Never send a repetitive fallback template.
+    return "", kind
 
 
-async def proactive_loop(application) -> None:
+async def _proactive_tick(application):
+    chat_id = _owner_chat_id()
+    if chat_id is None or not runner.bot.is_authorized(chat_id):
+        return
+    # Use strict reads: a database outage must not silently enable or reschedule.
+    read = lambda key: runner.memory_pg.get_setting(chat_id, key)
+    if read(KEY_ENABLED) == "0":
+        return
+    now = time.time()
+    next_at = int(read(KEY_NEXT_AT) or 0)
+    if not next_at:
+        _schedule_from_now(chat_id)
+        return
+    if now < next_at:
+        return
+    if _is_quiet_time():
+        runner.memory_pg.set_setting(chat_id, KEY_NEXT_AT, str(int(_next_after_quiet())))
+        return
+    # Serialize with normal replies; incoming text is recorded before generation.
+    async with runner.bot.chat_locks[chat_id]:
+        last_user_at = int(read(KEY_LAST_USER_AT) or 0)
+        if chat_id in _active_time_context or now - last_user_at < PROACTIVE_MIN_SECONDS:
+            _schedule_from_now(chat_id)
+            return
+        state = _load_state(chat_id)
+        text, kind = await _generate_proactive_message(chat_id, state)
+        # A message may arrive while the model is thinking.
+        if (chat_id in _active_time_context or int(read(KEY_LAST_USER_AT) or 0) != last_user_at
+                or _is_quiet_time() or read(KEY_ENABLED) == "0"):
+            _schedule_from_now(chat_id)
+            return
+        if not text:
+            print(f"Proactive skipped: chat_id={chat_id}, reason=repetition", flush=True)
+            _schedule_from_now(chat_id)
+            return
+        # Persist a cooldown BEFORE delivery. If Telegram times out after accepting
+        # a bubble, do not immediately retry the same message on the next tick.
+        _schedule_from_now(chat_id)
+        await _send_bubbles_to_chat(application, chat_id, text)
+        sent_at = int(time.time())
+        replied_during_send = int(read(KEY_LAST_USER_AT) or 0) != last_user_at
+        state.update(last_proactive_content=text, last_proactive_type=kind,
+                     user_replied_after_proactive=replied_during_send,
+                     silence_count=0 if replied_during_send else state["silence_count"] + 1)
+        state["recent"] = [*state["recent"], {"content": text, "type": kind, "sent_at": sent_at}][-12:]
+        _save_state(chat_id, state)
+        runner.memory_pg.set_setting(chat_id, KEY_LAST_PROACTIVE_AT, str(sent_at))
+        runner.memory_pg.set_setting(chat_id, KEY_LAST_INTERACTION_AT, str(sent_at))
+        runner.bot.histories[chat_id].append({"role": "assistant", "content": text})
+        runner.bot.histories[chat_id] = runner.bot.histories[chat_id][-runner.bot.MAX_HISTORY_MESSAGES:]
+        _schedule_from_now(chat_id)
+        print(f"Proactive sent: chat_id={chat_id}, type={kind}, silence={state['silence_count']}", flush=True)
+
+
+async def proactive_loop(application):
     await asyncio.sleep(8)
     while True:
         try:
-            chat_id = _owner_chat_id()
-            if chat_id is None:
-                await asyncio.sleep(60)
-                continue
-
-            enabled = _setting(chat_id, KEY_ENABLED, "1")
-            if enabled == "0":
-                await asyncio.sleep(60)
-                continue
-
-            count = _ensure_daily_counter(chat_id)
-            now = time.time()
-            now_local = _now_local()
-
-            next_raw = _setting(chat_id, KEY_NEXT_AT)
-            try:
-                next_at = int(next_raw) if next_raw else 0
-            except ValueError:
-                next_at = 0
-
-            if not next_at:
-                _schedule_from_now(chat_id)
-                await asyncio.sleep(30)
-                continue
-
-            if count >= PROACTIVE_DAILY_MAX:
-                _set_setting(chat_id, KEY_NEXT_AT, str(int(_next_after_quiet(now_local))))
-                await asyncio.sleep(90)
-                continue
-
-            if _is_quiet_time(now_local):
-                if next_at <= now:
-                    _set_setting(chat_id, KEY_NEXT_AT, str(int(_next_after_quiet(now_local))))
-                await asyncio.sleep(90)
-                continue
-
-            if now < next_at:
-                await asyncio.sleep(min(90, max(20, next_at - now)))
-                continue
-
-            last_user_at = _get_int_setting(chat_id, KEY_LAST_USER_AT)
-            if last_user_at and now - last_user_at < PROACTIVE_MIN_SECONDS:
-                _schedule_from_now(chat_id)
-                await asyncio.sleep(45)
-                continue
-
-            text = await _generate_proactive_message(chat_id)
-            if text and text.strip():
-                await _send_bubbles_to_chat(application, chat_id, text.strip())
-                sent_at = int(time.time())
-                _set_setting(chat_id, KEY_LAST_PROACTIVE_AT, str(sent_at))
-                _set_setting(chat_id, KEY_LAST_INTERACTION_AT, str(sent_at))
-                count += 1
-                _set_setting(chat_id, KEY_DAY, _today_key())
-                _set_setting(chat_id, KEY_DAY_COUNT, str(count))
-
-            _schedule_from_now(chat_id)
-            await asyncio.sleep(45)
-
+            await _proactive_tick(application)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(f"Proactive loop error: {exc!r}", flush=True)
-            await asyncio.sleep(90)
+            print(f"Proactive loop error: {type(exc).__name__}", flush=True)
+        await asyncio.sleep(30)
 
 
 # Whenever the user sends a normal message, preserve the previous timestamp for
@@ -425,6 +401,13 @@ async def handle_text_with_proactive_reset(update, context) -> None:
             "previous_user_at": previous_user_at,
             "current_user_at": received_at,
         }
+        try:
+            runner.memory_pg.set_setting(chat_id, KEY_LAST_USER_AT, str(received_at))
+            state = _load_state(chat_id)
+            state.update(user_replied_after_proactive=True, silence_count=0)
+            _save_state(chat_id, state)
+        except Exception as exc:
+            print(f"Proactive user state error: {type(exc).__name__}", flush=True)
 
     try:
         await _original_handle_text_with_memory(update, context)
@@ -433,7 +416,10 @@ async def handle_text_with_proactive_reset(update, context) -> None:
             _active_time_context.pop(chat_id, None)
             _set_setting(chat_id, KEY_LAST_USER_AT, str(received_at))
             _set_setting(chat_id, KEY_LAST_INTERACTION_AT, str(received_at))
-            _schedule_from_now(chat_id)
+            try:
+                _schedule_from_now(chat_id)
+            except Exception as exc:
+                print(f"Proactive reset error: {type(exc).__name__}", flush=True)
 
 
 runner.handle_text_with_memory = handle_text_with_proactive_reset
@@ -450,7 +436,7 @@ async def post_init_with_proactive(application) -> None:
     if chat_id is not None and not _setting(chat_id, KEY_NEXT_AT):
         _schedule_from_now(chat_id)
     print(
-        "Proactive messaging enabled: interval=50m-3h, daily_max=8, quiet=00:30-08:30 Asia/Shanghai; persistent_time_awareness=on",
+        "Proactive messaging enabled: interval=20m-3h, daily_max=unlimited, quiet=00:30-08:30 Asia/Shanghai; persistent_time_awareness=on",
         flush=True,
     )
 

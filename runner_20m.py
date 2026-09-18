@@ -7,7 +7,7 @@ import runner_strict_bubbles as app
 # Keep the faster proactive cadence without changing the rest of the roleplay,
 # memory, time-awareness, and strict-bubble behavior.
 app.PROACTIVE_MIN_SECONDS = 20 * 60
-app.PROACTIVE_MAX_SECONDS = 60 * 60
+app.PROACTIVE_MAX_SECONDS = 3 * 60 * 60
 
 # The actual favorite feature is implemented by the PostgreSQL memory analyzer.
 # The main chat model must never invent or expose a fake tool-call protocol.
@@ -165,50 +165,6 @@ async def handle_text_with_emotion(update, context) -> None:
 app.runner.handle_text_with_memory = handle_text_with_emotion
 app.runner.bot.handle_text = handle_text_with_emotion
 
-QUIET_START_MINUTE_OF_DAY = 30
-QUIET_END_MINUTE_OF_DAY = 8 * 60 + 30
-
-
-def fixed_is_quiet_time(dt=None) -> bool:
-    dt = dt or app._now_local()
-    minute_of_day = dt.hour * 60 + dt.minute
-    return QUIET_START_MINUTE_OF_DAY <= minute_of_day < QUIET_END_MINUTE_OF_DAY
-
-
-def fixed_next_after_quiet(now_local=None) -> float:
-    now_local = now_local or app._now_local()
-    target = now_local.replace(
-        hour=app.QUIET_END_HOUR,
-        minute=app.QUIET_END_MINUTE,
-        second=0,
-        microsecond=0,
-    )
-    if now_local >= target:
-        target += app.timedelta(days=1)
-    target += app.timedelta(minutes=app.random.randint(0, 25))
-    return target.timestamp()
-
-
-def fixed_schedule_from_now(chat_id: int) -> None:
-    now = app.time.time()
-    next_at = now + app._random_delay()
-    local_due = app.datetime.fromtimestamp(next_at, app.PROACTIVE_TZ)
-    if fixed_is_quiet_time(local_due):
-        next_at = fixed_next_after_quiet(local_due)
-
-    app._set_setting(chat_id, app.KEY_NEXT_AT, str(int(next_at)))
-    scheduled = app.datetime.fromtimestamp(next_at, app.PROACTIVE_TZ)
-    print(
-        f"Next proactive message scheduled: chat_id={chat_id}, at={scheduled:%Y-%m-%d %H:%M:%S %Z}",
-        flush=True,
-    )
-
-
-app._is_quiet_time = fixed_is_quiet_time
-app._next_after_quiet = fixed_next_after_quiet
-app._schedule_from_now = fixed_schedule_from_now
-
-
 async def fixed_post_init(application) -> None:
     try:
         emotion_pg.init_db()
@@ -228,11 +184,12 @@ async def fixed_post_init(application) -> None:
     application.bot_data["proactive_message_task"] = task
 
     chat_id = app._owner_chat_id()
-    if chat_id is not None and not app._setting(chat_id, app.KEY_NEXT_AT):
-        fixed_schedule_from_now(chat_id)
+    if chat_id is not None and (not app._setting(chat_id, app.KEY_NEXT_AT) or not app._setting(chat_id, "proactive_schedule_v2")):
+        app._schedule_from_now(chat_id)
+        app.runner.memory_pg.set_setting(chat_id, "proactive_schedule_v2", "1")
 
     print(
-        "Text-only mode enabled: interval=20m-60m, daily_max=8, "
+        "Text-only mode enabled: interval=20m-3h, daily_max=unlimited, "
         "quiet=00:30-08:30 Asia/Shanghai; persistent_time_awareness=on; "
         "favorites=backend_silent; emotion_state=possessive_persistent; "
         "possessive_style=warm_dark_attached; ellipsis=blocked; voice=off",
