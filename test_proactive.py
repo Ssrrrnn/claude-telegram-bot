@@ -48,6 +48,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         memory = types.SimpleNamespace(
             get_setting=lambda chat, key: self.settings.get((chat, key)),
             set_setting=lambda chat, key, value: self.settings.__setitem__((chat, key), value),
+            save_recent_proactive=lambda chat, text: None,
         )
         bot = types.SimpleNamespace(
             build_system_prompt=lambda chat: 'persona', TELEGRAM_OWNER_ID=1,
@@ -133,6 +134,12 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.app, '_now_local', return_value=self.now.replace(hour=3)):
             await self.app._proactive_tick(self.telegram)
         self.telegram.bot.send_message.assert_not_awaited()
+
+    def test_daytime_time_block_forbids_unsolicited_sleep(self):
+        block = self.app._time_awareness_block(1)
+        self.assertIn("唯一有效的当前时间", block)
+        self.assertIn("06:00-23:00行为锁", block)
+        self.assertIn("禁止说去睡", block)
 
 
 if __name__ == '__main__':

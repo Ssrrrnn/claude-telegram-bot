@@ -81,6 +81,26 @@ def init_db(retries: int = 12) -> None:
                         )
                         """
                     )
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS recent_conversation (
+                            id BIGSERIAL PRIMARY KEY,
+                            chat_id BIGINT NOT NULL,
+                            telegram_message_id BIGINT,
+                            user_text TEXT,
+                            assistant_text TEXT NOT NULL,
+                            kind TEXT NOT NULL DEFAULT 'chat',
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            UNIQUE(chat_id, telegram_message_id)
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_recent_conversation_chat_id
+                        ON recent_conversation(chat_id, id DESC)
+                        """
+                    )
                 conn.commit()
             return
         except Exception as exc:
@@ -115,6 +135,99 @@ def get_setting(chat_id: int, key: str) -> str | None:
             )
             row = cur.fetchone()
     return str(row["value"]) if row else None
+
+
+def save_recent_turn(
+    chat_id: int,
+    telegram_message_id: int,
+    user_text: str,
+    assistant_text: str,
+) -> None:
+    if not user_text.strip() or not assistant_text.strip():
+        return
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO recent_conversation(
+                    chat_id, telegram_message_id, user_text, assistant_text, kind
+                ) VALUES (%s, %s, %s, %s, 'chat')
+                ON CONFLICT(chat_id, telegram_message_id)
+                DO UPDATE SET
+                    user_text = EXCLUDED.user_text,
+                    assistant_text = EXCLUDED.assistant_text
+                """,
+                (chat_id, telegram_message_id, user_text, assistant_text),
+            )
+            _trim_recent_conversation(cur, chat_id)
+        conn.commit()
+
+
+def save_recent_proactive(chat_id: int, assistant_text: str) -> None:
+    if not assistant_text.strip():
+        return
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO recent_conversation(
+                    chat_id, telegram_message_id, user_text, assistant_text, kind
+                ) VALUES (%s, NULL, NULL, %s, 'proactive')
+                """,
+                (chat_id, assistant_text),
+            )
+            _trim_recent_conversation(cur, chat_id)
+        conn.commit()
+
+
+def _trim_recent_conversation(cur, chat_id: int, keep: int = 80) -> None:
+    cur.execute(
+        """
+        DELETE FROM recent_conversation
+        WHERE chat_id = %s
+          AND id NOT IN (
+              SELECT id FROM recent_conversation
+              WHERE chat_id = %s
+              ORDER BY id DESC
+              LIMIT %s
+          )
+        """,
+        (chat_id, chat_id, keep),
+    )
+
+
+def load_recent_messages(chat_id: int, limit_messages: int = 40) -> list[dict[str, str]]:
+    turn_limit = max(1, min(80, limit_messages))
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT user_text, assistant_text
+                FROM recent_conversation
+                WHERE chat_id = %s
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (chat_id, turn_limit),
+            )
+            rows = list(reversed(cur.fetchall()))
+
+    messages: list[dict[str, str]] = []
+    for row in rows:
+        user_text = row.get("user_text")
+        if isinstance(user_text, str) and user_text.strip():
+            messages.append({"role": "user", "content": user_text})
+        assistant_text = row.get("assistant_text")
+        if isinstance(assistant_text, str) and assistant_text.strip():
+            messages.append({"role": "assistant", "content": assistant_text})
+    return messages[-limit_messages:]
+
+
+def clear_recent_messages(chat_id: int) -> None:
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM recent_conversation WHERE chat_id = %s", (chat_id,))
+        conn.commit()
 
 
 def add_memory(

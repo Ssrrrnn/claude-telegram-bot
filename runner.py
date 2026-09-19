@@ -23,6 +23,7 @@ bot.delete_memory = memory_pg.delete_memory
 bot.clear_memories = memory_pg.clear_memories
 
 _active_query: dict[int, str] = {}
+_hydrated_chats: set[int] = set()
 _original_safe_reply = bot.safe_reply
 
 MEMORY_ANALYZER_COUNT_KEY = "memory_analyzer_turn_count"
@@ -299,6 +300,22 @@ async def handle_text_with_memory(update, context) -> None:
     if not user_text:
         return
 
+    if chat_id not in _hydrated_chats:
+        try:
+            restored = memory_pg.load_recent_messages(
+                chat_id,
+                bot.MAX_HISTORY_MESSAGES,
+            )
+            if restored:
+                bot.histories[chat_id] = restored
+                print(
+                    f"Recent conversation restored: chat_id={chat_id}, messages={len(restored)}",
+                    flush=True,
+                )
+            _hydrated_chats.add(chat_id)
+        except Exception as exc:
+            print(f"Recent conversation restore skipped: {type(exc).__name__}", flush=True)
+
     _active_query[chat_id] = user_text
     entry = {"role": "user", "content": user_text}
     try:
@@ -311,6 +328,17 @@ async def handle_text_with_memory(update, context) -> None:
         last = bot.histories[chat_id][-1]
         if last.get("role") == "assistant" and isinstance(last.get("content"), str):
             assistant_text = last["content"]
+
+    if assistant_text:
+        try:
+            memory_pg.save_recent_turn(
+                chat_id,
+                update.message.message_id,
+                user_text,
+                assistant_text,
+            )
+        except Exception as exc:
+            print(f"Recent conversation save skipped: {type(exc).__name__}", flush=True)
 
     should_analyze, reason = _should_run_memory_analyzer(chat_id, user_text)
     if not should_analyze:
@@ -336,6 +364,23 @@ async def handle_text_with_memory(update, context) -> None:
 
 
 bot.handle_text = handle_text_with_memory
+
+
+async def reset_with_persistent_context(update, context) -> None:
+    if not update.message:
+        return
+    chat_id = update.effective_chat.id
+    if not bot.is_authorized(chat_id):
+        await bot.reset(update, context)
+        return
+    try:
+        memory_pg.clear_recent_messages(chat_id)
+    except Exception as exc:
+        print(f"Persistent context reset failed: {type(exc).__name__}", flush=True)
+        await update.message.reply_text("短期上下文暂时无法清空，请稍后再试。")
+        return
+    await bot.reset(update, context)
+    _hydrated_chats.add(chat_id)
 
 
 async def relationship_command(update, context) -> None:
@@ -459,7 +504,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", bot.help_command))
     app.add_handler(CommandHandler("whoami", bot.whoami))
     app.add_handler(CommandHandler("auth", bot.auth))
-    app.add_handler(CommandHandler("reset", bot.reset))
+    app.add_handler(CommandHandler("reset", reset_with_persistent_context))
     app.add_handler(CommandHandler("model", bot.model_command))
     app.add_handler(CommandHandler("models", bot.models_command))
     app.add_handler(CommandHandler("worldbooks", bot.worldbooks_command))
