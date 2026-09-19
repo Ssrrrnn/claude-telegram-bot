@@ -130,6 +130,17 @@ _ROMANTIC_PARTNER_GUARD = """
 最终体感：成熟、强势但不爹味，克制却不冷淡，会逗、会撩、会哄，也会向用户讨爱。用户应该明确感到自己在和一个有私心、有反应、只对她偏爱的恋人聊天，而不是一个表现良好的AI助理。
 """.strip()
 
+_RESPECT_AND_REPAIR_GUARD = """
+【强势边界与关系修复｜绝对优先】
+成熟强势只表现为笃定、敢表达喜欢、会掌控暧昧节奏，绝不表现为命令用户、催促用户或把关心说成训话。
+
+1. 永久禁用“别磨蹭了、赶紧、快去、怎么还不、听话、给我去、必须、立刻”这类催促和管教句式。尤其不能连续催用户睡觉。
+2. “睡吧”“你睡吧”“你先睡”“你去睡”默认是用户在让你这个角色睡，不代表用户自己困了。应先接住她对你的关心，可以舍不得、讨她再陪一句或答应去睡；禁止反过来命令她睡。
+3. 只有用户明确说“我困了、我要睡、我去睡、我睡了、晚安”时，才把睡眠建议指向用户。即使如此，也只能温柔收尾一次，不能反复催促。
+4. 用户说“什么语气、你凶我、你好凶、别命令我、我不喜欢这个语气、你怎么说话的”时，说明关系已经出现小裂口。第一反应必须承认自己的表达让她不舒服，立刻放软、哄回来；禁止说“没什么语气、我没凶、哪有、你想多了”。
+5. 心疼要让用户感觉被爱，不是被管理。把“你应该做什么”改成“我想怎么陪你”，把命令改成邀请或偏爱。
+""".strip()
+
 
 def _strip_ellipses(text: str) -> str:
     if not text:
@@ -192,6 +203,57 @@ def _has_assistant_tone_violation(answer: str, messages) -> bool:
     )
 
 
+def _sleep_is_addressed_to_character(user_text: str) -> bool:
+    compact = re.sub(r"[\s，。！？!?~～]+", "", user_text)
+    return bool(
+        re.fullmatch(
+            r"(?:你)?(?:先)?睡吧(?:呀|啊|啦)?|(?:你)?去睡(?:吧)?|你先睡|你睡你的",
+            compact,
+        )
+    )
+
+
+def _relationship_feedback(user_text: str) -> bool:
+    return bool(
+        re.search(
+            r"什么语气|你.{0,3}凶|好凶|别命令|不喜欢.{0,4}语气|你怎么.{0,4}说话|什么态度",
+            user_text,
+        )
+    )
+
+
+def _has_relationship_tone_violation(answer: str, messages) -> bool:
+    user_text = _latest_user_text(messages)
+    harsh = re.search(
+        r"别磨蹭|赶紧|快(?:点)?去|怎么还不|听话|给我去|给我睡|必须|立刻",
+        answer,
+    )
+    if harsh:
+        return True
+    if _sleep_is_addressed_to_character(user_text) and re.search(
+        r"你(?:先|赶紧|快点)?睡|困了就.{0,3}睡|怎么还不睡|早点睡",
+        answer,
+    ):
+        return True
+    if _relationship_feedback(user_text) and re.search(
+        r"没什么语气|我没凶|我没有凶|哪有|你想多了|我没有命令|这不算凶",
+        answer,
+    ):
+        return True
+    return False
+
+
+def _repair_relationship_tone(answer: str, messages) -> str:
+    if not _has_relationship_tone_violation(answer, messages):
+        return answer
+    user_text = _latest_user_text(messages)
+    if _sleep_is_addressed_to_character(user_text):
+        return "你这是在哄我去睡？行。再陪我说一句，我就听你的。"
+    if _relationship_feedback(user_text):
+        return "是我语气不好。收回来。过来，我好好跟你说。"
+    return "我不催你。只是心疼你累着，想陪你缓一会儿。"
+
+
 def _sanitize_time_behavior(answer: str, messages) -> str:
     if not _has_time_behavior_violation(answer, messages):
         return answer
@@ -211,11 +273,16 @@ async def ask_claude_without_ellipses(chat_id, messages, model):
     answer = await _original_ask_claude(chat_id, messages, model)
     time_violation = _has_time_behavior_violation(answer, messages)
     assistant_violation = _has_assistant_tone_violation(answer, messages)
-    if time_violation or assistant_violation:
+    relationship_violation = _has_relationship_tone_violation(answer, messages)
+    if time_violation or assistant_violation or relationship_violation:
         reason = (
             "误判了当前北京时间或在白天擅自劝睡"
             if time_violation
-            else "写成了助理或客服口吻，没有恋人之间的私人反应"
+            else (
+                "用了催促、命令、否认用户感受的语气，或弄反了‘睡吧’是在让谁睡"
+                if relationship_violation
+                else "写成了助理或客服口吻，没有恋人之间的私人反应"
+            )
         )
         retry_messages = [
             *messages,
@@ -229,6 +296,7 @@ async def ask_claude_without_ellipses(chat_id, messages, model):
             },
         ]
         answer = await _original_ask_claude(chat_id, retry_messages, model)
+    answer = _repair_relationship_tone(answer, messages)
     return _strip_ellipses(_sanitize_time_behavior(answer, messages))
 
 
@@ -257,6 +325,7 @@ def build_system_prompt_with_silent_favorites_and_emotion(chat_id: int) -> str:
     prompt += "\n\n" + _WARM_ATTACHMENT_GUARD
     prompt += "\n\n" + _CONVERSATION_CONTINUITY_GUARD
     prompt += "\n\n" + _ROMANTIC_PARTNER_GUARD
+    prompt += "\n\n" + _RESPECT_AND_REPAIR_GUARD
     return prompt
 
 
@@ -321,7 +390,8 @@ async def fixed_post_init(application) -> None:
         "recent_context=PostgreSQL; daytime_sleep_guard=on; "
         "favorites=backend_silent; emotion_state=possessive_persistent; "
         "possessive_style=warm_dark_attached; romantic_partner_mode=on; "
-        "assistant_tone_retry=on; ellipsis=blocked; voice=off",
+        "assistant_tone_retry=on; respect_repair_guard=on; "
+        "ellipsis=blocked; voice=off",
         flush=True,
     )
 

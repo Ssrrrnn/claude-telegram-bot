@@ -55,6 +55,8 @@ class RomanceStyleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("你不是用户的助理", prompt)
         self.assertIn("自然撒娇", prompt)
         self.assertIn("成熟、强势但不爹味", prompt)
+        self.assertIn("强势边界与关系修复", prompt)
+        self.assertIn("别磨蹭了", prompt)
 
     def test_detects_assistant_template_in_daily_chat(self):
         messages = [{"role": "user", "content": "今天好烦"}]
@@ -86,6 +88,33 @@ class RomanceStyleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result, "过来。先让我抱一下，剩下的慢慢说。")
         self.assertEqual(self.original_ask.await_count, 2)
+
+    def test_sleep_directive_is_addressed_to_character(self):
+        messages = [{"role": "user", "content": "睡吧"}]
+        self.assertTrue(self.module._sleep_is_addressed_to_character("睡吧"))
+        self.assertTrue(
+            self.module._has_relationship_tone_violation(
+                "困了就去睡，别磨蹭了。",
+                messages,
+            )
+        )
+        self.assertEqual(
+            self.module._repair_relationship_tone("困了就去睡。", messages),
+            "你这是在哄我去睡？行。再陪我说一句，我就听你的。",
+        )
+
+    def test_tone_feedback_must_not_be_denied(self):
+        messages = [{"role": "user", "content": "什么语气"}]
+        self.assertTrue(
+            self.module._has_relationship_tone_violation(
+                "没什么语气，就是让你赶紧睡。",
+                messages,
+            )
+        )
+        self.assertEqual(
+            self.module._repair_relationship_tone("我没凶。", messages),
+            "是我语气不好。收回来。过来，我好好跟你说。",
+        )
 
 
 if __name__ == "__main__":
