@@ -88,6 +88,17 @@ _WARM_ATTACHMENT_GUARD = """
 最终目标：让用户感受到“这个人很黏我、很在意我、占有欲强，但不会训我；有点阴湿，却对我明显是热的”。
 """.strip()
 
+_CONVERSATION_CONTINUITY_GUARD = """
+【对话衔接校准｜最终优先级】
+1. 回复前先判断用户本条消息是在回答你上一句、补充上一件事、反驳、撒娇，还是开启新话题。只要能从最近对话确定，就必须接着原话题，不得擅自另起话题。
+2. “嗯、没有、还行、然后呢、是啊、你说呢、什么意思、随便”等短回复，必须结合紧邻的上一轮理解，禁止当成孤立句生成通用回复。
+3. 优先回应用户刚刚说的具体内容，再自然延伸；不要跳过关键词，不要凭空补出用户没说过的事件、动作、地点或情绪原因。
+4. 不要连续重复同一种安慰、同一个问题或同义句。若上一轮已经问过，下一轮应根据用户的回答继续，而不是重新询问。
+5. 主动消息之后用户一旦回复，该回复默认是在回应最近一条主动消息；除非用户明显开启新话题，否则要承接该消息的内容和情绪。
+6. 可以用熟悉的口吻和潜台词，但指代必须清楚。拿不准“他、那个、这件事”指什么时，用自然的一句轻问确认，不要编造。
+7. 每次回复应当像同一段真实聊天的下一拍：先接住，后反应，必要时再问一个问题。禁止突然总结关系、突然说教或突然切换场景。
+""".strip()
+
 
 def _strip_ellipses(text: str) -> str:
     if not text:
@@ -102,9 +113,67 @@ def _strip_ellipses(text: str) -> str:
 _original_ask_claude = app.runner.bot.ask_claude
 
 
+def _latest_user_text(messages) -> str:
+    for item in reversed(messages):
+        if item.get("role") == "user" and isinstance(item.get("content"), str):
+            return item["content"]
+    return ""
+
+
+def _has_time_behavior_violation(answer: str, messages) -> bool:
+    now = app._now_local()
+    user_text = _latest_user_text(messages)
+    if 6 <= now.hour < 23:
+        explicit_sleep = re.search(
+            r"困了|好困|想睡|要睡|去睡|睡觉|睡了|睡不着|失眠|晚安|熬夜|睡眠",
+            user_text,
+        )
+        unsolicited_sleep = re.search(
+            r"去睡|睡一会(?:儿)?|睡吧|早点睡|该睡了|上床睡|晚安",
+            answer,
+        )
+        if unsolicited_sleep and not explicit_sleep:
+            return True
+
+    if 6 <= now.hour < 18 and re.search(r"这么晚了|大半夜|深夜了", answer):
+        return True
+    if 12 <= now.hour < 23 and re.search(r"早上好|早安", answer):
+        return True
+    if (now.hour >= 23 or now.hour < 6) and re.search(r"早上好|中午好|下午好", answer):
+        return True
+    return False
+
+
+def _sanitize_time_behavior(answer: str, messages) -> str:
+    if not _has_time_behavior_violation(answer, messages):
+        return answer
+    replacements = (
+        (r"去睡(?:吧|觉)?", "先歇一会儿"),
+        (r"睡一会(?:儿)?", "歇一会儿"),
+        (r"早点睡|该睡了|上床睡|晚安", "先好好歇会儿"),
+        (r"这么晚了|大半夜|深夜了", "忙到现在"),
+        (r"早上好|早安|中午好|下午好", "在呢"),
+    )
+    for pattern, replacement in replacements:
+        answer = re.sub(pattern, replacement, answer)
+    return answer
+
+
 async def ask_claude_without_ellipses(chat_id, messages, model):
     answer = await _original_ask_claude(chat_id, messages, model)
-    return _strip_ellipses(answer)
+    if _has_time_behavior_violation(answer, messages):
+        retry_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "【生成校正，不是用户的新消息】上一版误判了当前北京时间或在白天擅自劝睡。"
+                    "保持原话题和人设，重新回复用户刚才那句话；不要提及校正、系统或时间规则。"
+                ),
+            },
+        ]
+        answer = await _original_ask_claude(chat_id, retry_messages, model)
+    return _strip_ellipses(_sanitize_time_behavior(answer, messages))
 
 
 # This covers normal non-streaming replies and proactive messages. Current
@@ -130,6 +199,7 @@ def build_system_prompt_with_silent_favorites_and_emotion(chat_id: int) -> str:
 
     prompt += "\n\n" + _POSSESSIVE_STYLE_GUARD
     prompt += "\n\n" + _WARM_ATTACHMENT_GUARD
+    prompt += "\n\n" + _CONVERSATION_CONTINUITY_GUARD
     return prompt
 
 
@@ -191,6 +261,7 @@ async def fixed_post_init(application) -> None:
     print(
         "Text-only mode enabled: interval=20m-3h, daily_max=unlimited, "
         "quiet=00:30-08:30 Asia/Shanghai; persistent_time_awareness=on; "
+        "recent_context=PostgreSQL; daytime_sleep_guard=on; "
         "favorites=backend_silent; emotion_state=possessive_persistent; "
         "possessive_style=warm_dark_attached; ellipsis=blocked; voice=off",
         flush=True,

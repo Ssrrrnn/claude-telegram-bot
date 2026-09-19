@@ -229,9 +229,21 @@ def _time_awareness_block(chat_id: int) -> str:
     last_interaction_at = _get_int_setting(chat_id, KEY_LAST_INTERACTION_AT)
 
     lines = [
-        "【隐形时间感知】",
-        f"当前北京时间：{now_local:%Y-%m-%d %H:%M}，周{_WEEKDAYS[now_local.weekday()]}，{_part_of_day(now_local)}。",
+        "【北京时间事实与行为锁｜高优先级】",
+        f"此刻唯一有效的当前时间是北京时间 {now_local:%Y-%m-%d %H:%M}，周{_WEEKDAYS[now_local.weekday()]}，当前属于{_part_of_day(now_local)}。",
+        "历史对话中出现的日期、钟点、早晚称呼只代表当时，绝不能覆盖此刻时间。禁止根据用户说累、烦、下班等状态自行推断现在是夜晚。",
     ]
+
+    if 6 <= now_local.hour < 23:
+        lines.append(
+            "现在处于06:00-23:00行为锁：除非用户本条消息明确说困了、想睡、要睡、失眠或直接要求睡眠建议，"
+            "否则禁止说去睡、睡一觉、早点睡、该睡了、晚安或把休息擅自解释成睡觉。"
+            "用户只说累或烦时，只能表达心疼，并建议歇一会、喝水、放松或陪伴。"
+        )
+    else:
+        lines.append(
+            "现在处于23:00-06:00深夜时段，可以自然关心睡眠，但不要机械催睡；仍以用户本条消息的真实意图为准。"
+        )
 
     if previous_user_at:
         gap = max(0, now_ts - previous_user_at)
@@ -258,7 +270,8 @@ def _time_awareness_block(chat_id: int) -> str:
         "这些时间信息只是你的自然时间感。只有当时间间隔、早晚、隔夜或久别对当前情绪有意义时才自然体现；"
         "不要每次报时，不要说‘系统显示/根据记录/距离上次消息X分钟’，也不要机械精确到分钟。"
         "优先把时间感转成符合人设的反应，例如久别后的惦记、短时间又见面的调侃、深夜的语气变化。"
-        "如果用户直接问时间或问多久没联系，可以准确回答。"
+        "如果用户直接问时间或问多久没联系，只能依据本区块的数据准确回答。"
+        "若当前消息没有时间相关性，不要主动报时或强行提早晚。"
     )
     return "\n".join(lines)
 
@@ -363,6 +376,10 @@ async def _proactive_tick(application):
         _save_state(chat_id, state)
         runner.memory_pg.set_setting(chat_id, KEY_LAST_PROACTIVE_AT, str(sent_at))
         runner.memory_pg.set_setting(chat_id, KEY_LAST_INTERACTION_AT, str(sent_at))
+        try:
+            runner.memory_pg.save_recent_proactive(chat_id, text)
+        except Exception as exc:
+            print(f"Recent proactive save skipped: {type(exc).__name__}", flush=True)
         runner.bot.histories[chat_id].append({"role": "assistant", "content": text})
         runner.bot.histories[chat_id] = runner.bot.histories[chat_id][-runner.bot.MAX_HISTORY_MESSAGES:]
         _schedule_from_now(chat_id)
