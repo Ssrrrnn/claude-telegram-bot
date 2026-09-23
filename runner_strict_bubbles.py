@@ -397,7 +397,8 @@ async def _proactive_tick(application):
             return
         voice_mode = voice_output.mode(runner.memory_pg.get_setting, chat_id)
         if not (voice_output.wants_audio(voice_mode, proactive=True)
-                and await voice_output.send_voice(application.bot, chat_id, text)):
+                and await voice_output.send_voice(application.bot, chat_id, text,
+                                                  get_setting=runner.memory_pg.get_setting)):
             await _send_bubbles_to_chat(application, chat_id, text)
         sent_at = int(time.time())
         replied_during_send = int(read(KEY_LAST_USER_AT) or 0) != last_user_at

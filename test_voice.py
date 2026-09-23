@@ -22,7 +22,7 @@ class VoiceDeliveryTests(unittest.TestCase):
             async def send_voice(self, **kwargs):
                 raise RuntimeError("telegram unavailable")
 
-        async def fake_synthesis(text):
+        async def fake_synthesis(text, voice_profile="natural", provider="edge"):
             return b"audio"
 
         fake_telegram = types.SimpleNamespace(InputFile=lambda stream, filename: stream)
@@ -36,8 +36,10 @@ class VoiceDeliveryTests(unittest.TestCase):
             async def send_voice(self, **kwargs):
                 sent.update(kwargs)
 
-        async def fake_synthesis(text):
+        async def fake_synthesis(text, voice_profile="natural", provider="edge"):
             self.assertEqual(text, "我在这儿。")
+            self.assertEqual(voice_profile, "natural")
+            self.assertEqual(provider, "edge")
             return b"mp3 bytes"
 
         fake_telegram = types.SimpleNamespace(InputFile=lambda stream, filename: (stream.read(), filename))
@@ -46,6 +48,45 @@ class VoiceDeliveryTests(unittest.TestCase):
         self.assertEqual(sent["voice"], (b"mp3 bytes", "reply.mp3"))
         self.assertEqual(sent["caption"], "我在这儿。")
         self.assertEqual(sent["reply_to_message_id"], 3)
+
+    def test_cosyvoice_requires_credentials_and_keeps_provider_choice(self):
+        setting = lambda chat, key: {voice_output.BACKEND_KEY: "cosyvoice"}.get(key)
+        with patch.object(voice_output, "COSYVOICE_API_KEY", ""):
+            self.assertEqual(voice_output.backend(setting, 7), "edge")
+        with patch.object(voice_output, "COSYVOICE_API_KEY", "test-key"):
+            self.assertEqual(voice_output.backend(setting, 7), "cosyvoice")
+
+    def test_cosyvoice_uses_suzu_compatible_speech_request(self):
+        recorded = {}
+
+        class Response:
+            content = b"mp3 bytes"
+            headers = {"content-type": "audio/mpeg"}
+
+            def raise_for_status(self):
+                pass
+
+        class Client:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def post(self, url, **kwargs):
+                recorded.update(url=url, **kwargs)
+                return Response()
+
+        fake_httpx = types.SimpleNamespace(AsyncClient=Client)
+        with patch.dict(sys.modules, {"httpx": fake_httpx}), patch.object(voice_output, "COSYVOICE_API_KEY", "test-key"):
+            result = asyncio.run(voice_output.synthesize("我在这儿", "deep", "cosyvoice"))
+        self.assertEqual(result, b"mp3 bytes")
+        self.assertEqual(recorded["json"]["voice"], "FunAudioLLM/CosyVoice2-0.5B:benjamin")
+        self.assertEqual(recorded["json"]["response_format"], "mp3")
+        self.assertEqual(recorded["url"], voice_output.COSYVOICE_API_URL)
 
 
 if __name__ == "__main__":
