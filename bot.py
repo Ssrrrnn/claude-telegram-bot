@@ -451,7 +451,19 @@ async def generate_and_send(
                 except Exception:
                     await update.message.reply_text(chunk)
         else:
-            await safe_reply(update, answer)
+            import voice_output
+            user_text = history_user_entry.get("content", "")
+            voice_mode = voice_output.mode(get_setting, chat_id)
+            use_voice = voice_output.wants_audio(
+                voice_mode,
+                from_voice=getattr(update.message, "from_voice", False),
+                user_text=user_text if isinstance(user_text, str) else "",
+            )
+            if not (use_voice and await voice_output.send_voice(
+                context.bot, chat_id, answer,
+                reply_to_message_id=update.message.message_id,
+            )):
+                await safe_reply(update, answer)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

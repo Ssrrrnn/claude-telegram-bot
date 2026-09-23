@@ -10,6 +10,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 import bot
 import memory_pg
 import continuity
+import voice_output
 
 # Default to chat-bubble mode instead of live-edit streaming.
 bot.stream_preferences = defaultdict(lambda: False)
@@ -519,9 +520,70 @@ async def post_init(application) -> None:
             BotCommand("forget", "删除一条长期记忆"),
             BotCommand("forgetall", "清空长期记忆"),
             BotCommand("stream", "开关流式输出"),
+            BotCommand("voice", "语音回复开关"),
             BotCommand("whoami", "查看 Telegram ID"),
             BotCommand("help", "查看帮助"),
         ]
+    )
+
+
+class _TranscriptMessage:
+    def __init__(self, original, transcript):
+        self.original = original
+        self.text = transcript
+        self.from_voice = True
+
+    def __getattr__(self, name):
+        return getattr(self.original, name)
+
+
+class _TranscriptUpdate:
+    def __init__(self, original, transcript):
+        self.original = original
+        self.message = _TranscriptMessage(original.message, transcript)
+
+    def __getattr__(self, name):
+        return getattr(self.original, name)
+
+
+async def handle_voice_with_memory(update, context):
+    if not update.message:
+        return
+    chat_id = update.effective_chat.id
+    if not bot.is_authorized(chat_id):
+        await update.message.reply_text("请先认证。")
+        return
+    media = update.message.voice or update.message.audio
+    if not media:
+        return
+    if getattr(media, "file_size", 0) and media.file_size > 12_000_000:
+        await update.message.reply_text("这条语音太长了，发短一点我才能听清。")
+        return
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        tg_file = await media.get_file()
+        raw = bytes(await tg_file.download_as_bytearray())
+        if len(raw) > 12_000_000:
+            await update.message.reply_text("这条语音太长了，发短一点我才能听清。")
+            return
+        transcript = await bot.transcribe_audio(
+            raw,
+            getattr(media, "file_name", None) or "voice.ogg",
+            getattr(media, "mime_type", None) or "audio/ogg",
+        )
+        if not transcript.strip():
+            raise ValueError("empty transcript")
+    except Exception as exc:
+        print(f"Voice transcription unavailable: {type(exc).__name__}", flush=True)
+        await update.message.reply_text("这条语音我暂时没听清，你先打字告诉我，好吗？")
+        return
+    await bot.handle_text(_TranscriptUpdate(update, transcript.strip()), context)
+
+
+async def voice_command(update, context):
+    await voice_output.voice_command(
+        update, context, get_setting=memory_pg.get_setting,
+        set_setting=memory_pg.set_setting,
     )
 
 
@@ -553,8 +615,9 @@ def main() -> None:
     app.add_handler(CommandHandler("forget", bot.forget_command))
     app.add_handler(CommandHandler("forgetall", bot.forgetall_command))
     app.add_handler(CommandHandler("stream", bot.stream_command))
+    app.add_handler(CommandHandler("voice", voice_command))
     app.add_handler(MessageHandler(filters.PHOTO, bot.handle_photo))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, bot.handle_voice))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_with_memory))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_with_memory))
     app.add_error_handler(bot.error_handler)
 
