@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import realtime_clock
 from telegram import BotCommand, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
@@ -284,10 +285,13 @@ def api_headers() -> dict[str, str]:
 
 
 async def ask_claude(chat_id: int, messages: list[dict[str, Any]], model: str) -> str:
+    clock_reply = realtime_clock.direct_clock_reply(messages)
+    if clock_reply is not None:
+        return clock_reply
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": build_system_prompt(chat_id)},
+            {"role": "system", "content": build_system_prompt(chat_id) + "\n\n" + realtime_clock.request_clock_block()},
             *messages,
         ],
         "stream": False,
@@ -305,10 +309,14 @@ async def ask_claude(chat_id: int, messages: list[dict[str, Any]], model: str) -
 
 
 async def stream_claude(chat_id: int, messages: list[dict[str, Any]], model: str):
+    clock_reply = realtime_clock.direct_clock_reply(messages)
+    if clock_reply is not None:
+        yield clock_reply
+        return
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": build_system_prompt(chat_id)},
+            {"role": "system", "content": build_system_prompt(chat_id) + "\n\n" + realtime_clock.request_clock_block()},
             *messages,
         ],
         "stream": True,
