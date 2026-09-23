@@ -23,8 +23,8 @@ class ClockTests(unittest.TestCase):
         instant = datetime(2026, 9, 23, 16, 1, tzinfo=timezone.utc)
         with patch.object(clock, "datetime") as dt:
             dt.now.side_effect = lambda tz: instant.astimezone(tz)
-            reply = clock.direct_clock_reply([{"role": "user", "content": "今天几号"}])
-            self.assertEqual(reply, "按北京时间，今天是2026年9月24日，星期四。")
+            self.assertEqual(clock.render_clock_reply("[[LIVE_CLOCK]]。", "date"), "9月24日。")
+            self.assertEqual(clock.render_clock_reply("[[LIVE_CLOCK]]。", "weekday"), "星期四。")
             self.assertEqual(clock.now_local().hour, 0)
             dt.now.assert_called_with(clock.BEIJING)
 
@@ -34,8 +34,18 @@ class ClockTests(unittest.TestCase):
             datetime(2026, 9, 23, 23, 59, tzinfo=clock.BEIJING),
             datetime(2026, 9, 24, 0, 0, tzinfo=clock.BEIJING),
         ]):
-            self.assertEqual(clock.direct_clock_reply(history), "现在是北京时间 23:59。")
-            self.assertEqual(clock.direct_clock_reply(history), "现在是北京时间 00:00。")
+            kind = clock.clock_question(clock.latest_user_text(history))
+            self.assertEqual(clock.render_clock_reply("[[LIVE_CLOCK]]。", kind), "晚上十一点五十九分。")
+            self.assertEqual(clock.render_clock_reply("[[LIVE_CLOCK]]。", kind), "凌晨十二点整。")
+
+    def test_invalid_clock_templates_cannot_leak_or_invent_numbers(self):
+        with patch.object(clock, "now_local", return_value=datetime(2026, 9, 23, 14, 5, tzinfo=clock.BEIJING)):
+            for answer in ["[[LIVE_CLOCK]]，现在03:00", "现在凌晨三点", "[[LIVE_CLOCK]] [[LIVE_CLOCK]]", "[[LIVE_", "[[LIVE_CLOCK]]，[[OTHER]]"]:
+                self.assertEqual(clock.render_clock_reply(answer, "time"), "下午两点零五分。")
+
+    def test_style_retry_keeps_original_clock_question(self):
+        messages = [{"role": "user", "content": "现在几点"}, {"role": "user", "content": "【生成校正，不是用户的新消息】请自然回复"}]
+        self.assertEqual(clock.clock_question(clock.latest_user_text(messages)), "time")
 
 
 class ClockTransportTests(unittest.IsolatedAsyncioTestCase):
@@ -49,12 +59,33 @@ class ClockTransportTests(unittest.IsolatedAsyncioTestCase):
             spec.loader.exec_module(self.bot)
         self.bot.build_system_prompt = lambda chat: "persona plus stale historical time 02:00"
 
-    async def test_direct_clock_bypasses_api_in_both_modes(self):
+    async def test_clock_preserves_context_and_voice_in_both_modes(self):
         messages = [{"role": "user", "content": "你知道现在几点了吗"}]
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"choices": [{"message": {"content": "[[LIVE_CLOCK]]了。你刚才说的那件事，我还记着。"}}]}
+        client = MagicMock()
+        client.post = AsyncMock(return_value=response)
+        self.bot.httpx.AsyncClient.return_value.__aenter__ = AsyncMock(return_value=client)
         with patch.object(clock, "now_local", return_value=datetime(2026, 9, 23, 14, 32, tzinfo=clock.BEIJING)):
-            self.assertEqual(await self.bot.ask_claude(1, messages, "mock"), "现在是北京时间 14:32。")
-            self.assertEqual([s async for s in self.bot.stream_claude(1, messages, "mock")], ["现在是北京时间 14:32。"])
-        self.bot.httpx.AsyncClient.assert_not_called()
+            expected = "下午两点三十二分了。你刚才说的那件事，我还记着。"
+            self.assertEqual(await self.bot.ask_claude(1, messages, "mock"), expected)
+            self.assertEqual([s async for s in self.bot.stream_claude(1, messages, "mock")], [expected])
+        self.assertEqual(client.post.await_count, 2)
+        client.stream.assert_not_called()
+        self.assertEqual(client.post.call_args.kwargs["json"]["messages"][1:], messages)
+
+    async def test_time_is_sampled_after_generation(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"choices": [{"message": {"content": "[[LIVE_CLOCK]]了。"}}]}
+        client = MagicMock()
+        client.post = AsyncMock(return_value=response)
+        self.bot.httpx.AsyncClient.return_value.__aenter__ = AsyncMock(return_value=client)
+        with patch.object(clock, "now_local", side_effect=[
+            datetime(2026, 9, 23, 23, 59, tzinfo=clock.BEIJING),
+            datetime(2026, 9, 24, 0, 0, tzinfo=clock.BEIJING),
+        ]):
+            result = await self.bot.ask_claude(1, [{"role": "user", "content": "今天几号"}], "mock")
+        self.assertEqual(result, "9月24日了。")
 
     async def test_fresh_clock_at_end_of_actual_request_both_modes(self):
         response = MagicMock(status_code=200)
