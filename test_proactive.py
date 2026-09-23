@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 import proactive_policy as policy
+import continuity
 
 
 class PolicyTests(unittest.TestCase):
@@ -50,6 +51,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             set_setting=lambda chat, key, value: self.settings.__setitem__((chat, key), value),
             save_recent_proactive=lambda chat, text: None,
         )
+        def mutate(chat, operation):
+            state = operation(continuity.decode(self.settings.get((chat, continuity.KEY))))
+            self.settings[chat, continuity.KEY] = __import__('json').dumps(state)
+            return state
+        memory.mutate_continuity = mutate
         bot = types.SimpleNamespace(
             build_system_prompt=lambda chat: 'persona', TELEGRAM_OWNER_ID=1,
             histories=defaultdict(list), chat_locks=defaultdict(asyncio.Lock),
@@ -84,6 +90,48 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(state['recent']), 1)
         await self.app._proactive_tick(self.telegram)
         self.assertEqual(self.telegram.bot.send_message.await_count, 1)
+
+    async def test_followup_has_reason_and_is_claimed_once(self):
+        state = continuity.empty()
+        now = self.now.timestamp()
+        state['threads'] = [{'id': 'shot', 'title': '镜头修改', 'purpose': '问修改是否顺利',
+            'category': 'work', 'subject': 'user', 'realm': 'real', 'status': 'open',
+            'due_at': now - 1, 'expires_at': now + 3600, 'contacted_at': None}]
+        self.app.runner.memory_pg.mutate_continuity(1, lambda _: state)
+        self.settings[1, self.app.KEY_NEXT_AT] = str(int(now) + 7200)
+        self.app.runner.bot.ask_claude.return_value = '那个镜头后来顺了吗？'
+        await self.app._proactive_tick(self.telegram)
+        sent = self.app.runner.bot.ask_claude.call_args.args[1][-1]['content']
+        self.assertIn('问修改是否顺利', sent)
+        self.assertIsNotNone(continuity.load(self.app.runner.memory_pg, 1)['threads'][0]['contacted_at'])
+        await self.app._proactive_tick(self.telegram)
+        self.assertEqual(self.telegram.bot.send_message.await_count, 1)
+
+    async def test_model_can_decline_contact_without_sending_sentinel(self):
+        self.app.runner.bot.ask_claude.return_value = 'NO_REPLY'
+        await self.app._proactive_tick(self.telegram)
+        self.telegram.bot.send_message.assert_not_called()
+        self.assertGreater(int(self.settings[1, self.app.KEY_NEXT_AT]), self.now.timestamp())
+
+    async def test_declined_due_followup_does_not_retry_every_tick(self):
+        state = continuity.empty()
+        now = self.now.timestamp()
+        state['threads'] = [{'id': 'shot', 'title': '镜头修改', 'purpose': '问修改是否顺利',
+            'realm': 'real', 'status': 'open', 'due_at': now - 1,
+            'expires_at': now + 20000, 'contacted_at': None}]
+        self.app.runner.memory_pg.mutate_continuity(1, lambda _: state)
+        self.app.runner.bot.ask_claude.return_value = 'NO_REPLY'
+        await self.app._proactive_tick(self.telegram)
+        await self.app._proactive_tick(self.telegram)
+        self.assertEqual(self.app.runner.bot.ask_claude.await_count, 1)
+        self.telegram.bot.send_message.assert_not_called()
+
+    async def test_explicit_sleep_blocks_even_daytime_proactive_contact(self):
+        state = continuity.receive_state(continuity.empty(), '我睡了', 5, self.now.timestamp())
+        self.app.runner.memory_pg.mutate_continuity(1, lambda _: state)
+        await self.app._proactive_tick(self.telegram)
+        self.app.runner.bot.ask_claude.assert_not_called()
+        self.telegram.bot.send_message.assert_not_called()
 
     async def test_duplicate_retries_then_skips_even_after_memory_restart(self):
         state = self.app._load_state(1)
