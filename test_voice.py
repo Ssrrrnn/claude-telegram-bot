@@ -22,7 +22,7 @@ class VoiceDeliveryTests(unittest.TestCase):
             async def send_voice(self, **kwargs):
                 raise RuntimeError("telegram unavailable")
 
-        async def fake_synthesis(text, voice_profile="natural", provider="edge"):
+        async def fake_synthesis(text, voice_profile="natural", provider="edge", custom_voice=""):
             return b"audio"
 
         fake_telegram = types.SimpleNamespace(InputFile=lambda stream, filename: stream)
@@ -36,7 +36,7 @@ class VoiceDeliveryTests(unittest.TestCase):
             async def send_voice(self, **kwargs):
                 sent.update(kwargs)
 
-        async def fake_synthesis(text, voice_profile="natural", provider="edge"):
+        async def fake_synthesis(text, voice_profile="natural", provider="edge", custom_voice=""):
             self.assertEqual(text, "我在这儿。")
             self.assertEqual(voice_profile, "natural")
             self.assertEqual(provider, "edge")
@@ -87,6 +87,65 @@ class VoiceDeliveryTests(unittest.TestCase):
         self.assertEqual(recorded["json"]["voice"], "FunAudioLLM/CosyVoice2-0.5B:benjamin")
         self.assertEqual(recorded["json"]["response_format"], "mp3")
         self.assertEqual(recorded["url"], voice_output.COSYVOICE_API_URL)
+
+    def test_custom_voice_uri_is_used_without_model_prefix(self):
+        sent = {}
+
+        class Response:
+            content = b"mp3 bytes"
+            headers = {"content-type": "audio/mpeg"}
+
+            def raise_for_status(self):
+                pass
+
+        class Client:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def post(self, url, **kwargs):
+                sent.update(kwargs)
+                return Response()
+
+        with patch.dict(sys.modules, {"httpx": types.SimpleNamespace(AsyncClient=Client)}), patch.object(voice_output, "COSYVOICE_API_KEY", "test-key"):
+            result = asyncio.run(voice_output.synthesize("在呢", "custom", "cosyvoice", "speech:myvoice:abc"))
+        self.assertEqual(result, b"mp3 bytes")
+        self.assertEqual(sent["json"]["voice"], "speech:myvoice:abc")
+
+    def test_upload_voice_sends_reference_and_returns_uri(self):
+        sent = {}
+
+        class Response:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"uri": "speech:myvoice:abc"}
+
+        class Client:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def post(self, url, **kwargs):
+                sent.update(url=url, **kwargs)
+                return Response()
+
+        with patch.dict(sys.modules, {"httpx": types.SimpleNamespace(AsyncClient=Client)}), patch.object(voice_output, "COSYVOICE_API_KEY", "test-key"):
+            uri = asyncio.run(voice_output.upload_custom_voice(b"audio", "sample.mp3", "audio/mpeg", "myvoice", "今天天气不错"))
+        self.assertEqual(uri, "speech:myvoice:abc")
+        self.assertEqual(sent["data"]["text"], "今天天气不错")
+        self.assertEqual(sent["files"]["file"], ("sample.mp3", b"audio", "audio/mpeg"))
 
 
 if __name__ == "__main__":
