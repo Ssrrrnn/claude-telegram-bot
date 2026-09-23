@@ -1,7 +1,10 @@
 import unittest
+import time
+from unittest.mock import AsyncMock, patch
 
 from qq_connector import QQConnector, _message_parts, _qq_image_url, last_chat_platform
 from qq_gateway import QQGateway
+import qq_stickers
 
 
 class FakeMemory:
@@ -31,6 +34,65 @@ class FakeMemory:
 
 
 class QQTests(unittest.IsolatedAsyncioTestCase):
+    async def test_spontaneous_sticker_needs_matching_tone_and_cooldown(self):
+        memory = FakeMemory()
+        connector = QQConnector(owner_chat_id=42, pair_code="secret-pairing-code-123",
+                                expected_self_uin="88888888", handler=None, bot=object(), memory=memory)
+        connector._send_market_sticker = AsyncMock()
+        stickers = [
+            {"emoji_package_id": 1, "emoji_id": "1", "key": "token", "summary": "抱抱"},
+            {"emoji_package_id": 1, "emoji_id": "2", "key": "token", "summary": "大笑"},
+        ]
+        memory.set_setting(42, qq_stickers.LAST_SENT_KEY, str(time.time()))
+        with patch("qq_connector.random.random", return_value=0):
+            self.assertFalse(await connector._maybe_send_sticker(None, "12345678", "早", [
+                {"type": "text", "text": "想你，抱一下。"}], stickers))
+        connector._send_market_sticker.assert_not_awaited()
+        memory.set_setting(42, qq_stickers.LAST_SENT_KEY, "0")
+        with patch("qq_connector.random.random", return_value=0):
+            self.assertTrue(await connector._maybe_send_sticker(None, "12345678", "早", [
+                {"type": "text", "text": "想你，抱一下。"}], stickers))
+        self.assertEqual(connector._send_market_sticker.await_args.args[-1]["summary"], "抱抱")
+        self.assertFalse(await connector._maybe_send_sticker(None, "12345678", "早", [
+            {"type": "text", "text": "想你，抱一下。"}], stickers))
+
+    async def test_owner_sticker_is_saved_and_can_be_sent_as_qq_market_sticker(self):
+        memory = FakeMemory()
+        memory.set_setting(42, "qq_owner_uin_v1", "12345678")
+
+        async def handler(update, context):
+            await update.message.reply_text("好，给你。")
+
+        connector = QQConnector(owner_chat_id=42, pair_code="secret-pairing-code-123",
+                                expected_self_uin="88888888", handler=handler, bot=object(), memory=memory)
+        sent = []
+
+        async def action(ws, name, params):
+            sent.append((name, params))
+            return {"message_id": 10}
+
+        connector.action = action
+        base = {"post_type": "message", "message_type": "private", "self_id": 88888888,
+                "user_id": 12345678}
+        sticker = {"emoji_package_id": 1, "emoji_id": "hello", "key": "token", "summary": "抱抱"}
+        await connector.handle_event(None, {**base, "message_id": 1,
+            "message": [{"type": "mface", "data": sticker}]})
+        self.assertEqual(len(qq_stickers.load(memory.get_setting(42, qq_stickers.SETTING_KEY))), 1)
+        self.assertEqual(len(sent), 1)  # Receiving it does not immediately echo it back.
+
+        await connector.handle_event(None, {**base, "message_id": 2,
+            "message": [{"type": "text", "data": {"text": "给我发个表情包"}}]})
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(sent[-1][1]["message"], [{"type": "mface", "data": sticker}])
+        self.assertTrue(memory.get_setting(42, qq_stickers.LAST_SENT_KEY))
+
+    def test_sticker_requests_respect_negation_and_saved_stickers_are_bounded(self):
+        self.assertTrue(qq_stickers.explicit_request("来张表情包"))
+        self.assertFalse(qq_stickers.explicit_request("别发个表情包了"))
+        self.assertFalse(qq_stickers.explicit_request("怎么还没发表情包"))
+        self.assertEqual(qq_stickers.remember(None, {"message": [{"type": "mface",
+            "data": {"emoji_package_id": 1, "emoji_id": "", "key": "bad"}}]}), ([], False))
+
     def test_qq_sticker_segments_are_not_dropped(self):
         event = {"message": [
             {"type": "text", "data": {"text": "给你"}},
