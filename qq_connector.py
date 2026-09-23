@@ -29,6 +29,20 @@ def _private_message(event, self_uin):
     return str(sender).isdigit() and str(sender) != str(self_uin)
 
 
+def last_chat_platform(memory, chat_id):
+    """Recover the channel of the latest persisted human turn on first upgrade."""
+    with memory._connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT telegram_message_id FROM recent_conversation "
+                "WHERE chat_id = %s AND kind = 'chat' ORDER BY id DESC LIMIT 1",
+                (chat_id,),
+            )
+            row = cur.fetchone()
+    message_id = row["telegram_message_id"] if row else None
+    return "qq" if isinstance(message_id, int) and message_id < 0 else "telegram"
+
+
 class QQConnector:
     def __init__(self, *, owner_chat_id, pair_code, expected_self_uin, handler, bot, memory):
         self.owner_chat_id = int(owner_chat_id)
@@ -191,6 +205,16 @@ async def start(application, *, handler, bot, memory):
             and len(pair_code) >= 16 and self_uin.isdigit() and bot.TELEGRAM_OWNER_ID):
         print("QQ OneBot inactive: missing private URL, token, pair code, self UIN or Telegram owner", flush=True)
         return
+    if memory.get_setting(bot.TELEGRAM_OWNER_ID, OWNER_KEY) and not memory.get_setting(
+        bot.TELEGRAM_OWNER_ID, PLATFORM_KEY,
+    ):
+        try:
+            memory.set_setting(
+                bot.TELEGRAM_OWNER_ID, PLATFORM_KEY,
+                last_chat_platform(memory, bot.TELEGRAM_OWNER_ID),
+            )
+        except Exception as exc:
+            print(f"QQ platform bootstrap skipped: {type(exc).__name__}", flush=True)
     connector = QQConnector(
         owner_chat_id=bot.TELEGRAM_OWNER_ID, pair_code=pair_code,
         expected_self_uin=self_uin, handler=handler, bot=bot, memory=memory,

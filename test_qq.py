@@ -1,6 +1,6 @@
 import unittest
 
-from qq_connector import QQConnector
+from qq_connector import QQConnector, last_chat_platform
 from qq_gateway import QQGateway
 
 
@@ -31,6 +31,19 @@ class FakeMemory:
 
 
 class QQTests(unittest.IsolatedAsyncioTestCase):
+    def test_first_upgrade_recovers_last_human_platform(self):
+        class Memory:
+            def __init__(self, message_id): self.message_id = message_id
+            def _connect(self): return self
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def cursor(self): return self
+            def execute(self, query, params): pass
+            def fetchone(self): return {"telegram_message_id": self.message_id}
+
+        self.assertEqual(last_chat_platform(Memory(-123), 42), "qq")
+        self.assertEqual(last_chat_platform(Memory(123), 42), "telegram")
+
     async def test_proactive_sends_to_paired_qq_owner(self):
         memory = FakeMemory()
         memory.set_setting(42, "qq_owner_uin_v1", "12345678")
