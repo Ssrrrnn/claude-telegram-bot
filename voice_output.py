@@ -10,6 +10,7 @@ PROFILE_KEY = "voice_profile_v1"
 BACKEND_KEY = "voice_backend_v1"
 CUSTOM_VOICE_KEY = "voice_custom_uri_v1"
 FISH_VOICE_KEY = "voice_fish_id_v1"
+FISH_EXPRESSION_KEY = "voice_fish_expression_v1"
 DEFAULT_MODE = "auto"
 COSYVOICE_API_KEY = os.getenv("COSYVOICE_API_KEY", "").strip()
 COSYVOICE_API_URL = "https://api.siliconflow.cn/v1/audio/speech"
@@ -32,6 +33,13 @@ COSYVOICE_VOICES = {
 }
 MAX_SPEECH_CHARS = 450
 MAX_AUDIO_BYTES = 3_000_000
+FISH_SAMPLES = {
+    "excited": "你回来了！这消息我可等了一整天。过来，让我好好听你说。",
+    "soft": "辛苦了。先缓一缓，想说的话慢慢告诉我。",
+    "relaxed": "你回来了。今天怎么样？慢慢说，我听着。",
+    "curious": "等等，后来呢？你刚刚说到最有意思的地方。",
+}
+FISH_SAMPLE_CUES = {"excited": "excited", "soft": "soft tone", "relaxed": "relaxed", "curious": "curious"}
 
 
 def mode(get_setting, chat_id):
@@ -85,6 +93,17 @@ def clean_speech(text):
     # run-on sentence. Avoid inserting punctuation after an existing stop.
     value = re.sub(r"(?<![。！？!?，,；;：:])\s*\n+\s*", "。", value)
     return re.sub(r"\s+", " ", value).strip()
+
+
+def fish_auto_expression(text):
+    """Mark only clear emotional lines; ordinary replies retain the voice's natural delivery."""
+    if re.search(r"(?:太好了|好棒|恭喜你|真为你高兴|太开心了)[！!]", text):
+        return "excited"
+    if re.search(r"(?:辛苦了|别怕|别担心|我陪你|慢慢来|先缓一缓|抱抱|心疼你)", text):
+        return "soft tone"
+    if re.search(r"(?:后来呢|然后呢|接下来呢|怎么做到的)[？?]", text):
+        return "curious"
+    return ""
 
 
 async def synthesize_cosyvoice(text, voice_profile=DEFAULT_PROFILE, custom_voice=""):
@@ -160,7 +179,7 @@ async def synthesize(text, voice_profile=DEFAULT_PROFILE, provider="edge", custo
 
 async def send_voice(bot, chat_id, text, *, reply_to_message_id=None,
                      get_setting=None, voice_profile=None, caption=None,
-                     provider=None):
+                     provider=None, fish_cue=None):
     speech = clean_speech(text)
     if not speech:
         return False
@@ -171,7 +190,13 @@ async def send_voice(bot, chat_id, text, *, reply_to_message_id=None,
         voice_key = FISH_VOICE_KEY if selected_backend == "fish" else CUSTOM_VOICE_KEY
         custom_voice = (fish_voice(get_setting, chat_id) if selected_backend == "fish" else
                         get_setting(chat_id, voice_key) if get_setting else "")
-        audio = await synthesize(speech, selected, selected_backend, custom_voice or "")
+        synthesis_text = speech
+        if selected_backend == "fish":
+            enabled = not get_setting or get_setting(chat_id, FISH_EXPRESSION_KEY) != "off"
+            cue = fish_cue or (fish_auto_expression(speech) if enabled else "")
+            if cue:
+                synthesis_text = f"[{cue}] {speech}"
+        audio = await synthesize(synthesis_text, selected, selected_backend, custom_voice or "")
         await bot.send_voice(
             chat_id=chat_id,
             voice=InputFile(io.BytesIO(audio), filename="reply.mp3"),
@@ -403,8 +428,29 @@ async def voice_command(update, context, *, get_setting, set_setting):
                 "\n例如 /voice tone deep；发 /voice sample 试听。"
             )
         return
+    if option == "expression":
+        selected = args[1].lower() if len(args) > 1 else ""
+        if selected in ("on", "off"):
+            set_setting(chat_id, FISH_EXPRESSION_KEY, selected)
+        enabled = get_setting(chat_id, FISH_EXPRESSION_KEY) != "off"
+        await update.message.reply_text(
+            f"Fish Audio 情绪语气：{'开启' if enabled else '关闭'}。"
+            "\n用 /voice expression on 或 /voice expression off 切换；"
+            "只有明显开心、安慰或好奇的短句才会自动添加标签。"
+        )
+        return
     if option == "sample":
         chosen = args[1].lower() if len(args) > 1 else profile(get_setting, chat_id)
+        if chosen in FISH_SAMPLE_CUES and backend(get_setting, chat_id) == "fish":
+            sample = FISH_SAMPLES[chosen]
+            success = await send_voice(
+                context.bot, chat_id, sample, get_setting=get_setting,
+                voice_profile="custom", fish_cue=FISH_SAMPLE_CUES[chosen],
+                caption=f"Fish Audio {chosen}：{sample}",
+            )
+            if not success:
+                await update.message.reply_text("这次试听没合成成功，稍后再试。文字聊天不受影响。")
+            return
         if backend(get_setting, chat_id) == "fish" and chosen in PROFILES:
             await update.message.reply_text("Fish Audio 使用克隆音色 custom。发 /voice sample 试听。")
             return
@@ -429,5 +475,6 @@ async def voice_command(update, context, *, get_setting, set_setting):
          "auto": "语音已设为自动：你发语音或明确要语音时，我回语音；其他时候回文字。",
          "on": "语音回复已开启：适合的短回复会发语音；长回复或合成失败时回文字。"}[current]
         + "\n用 /voice on、/voice auto、/voice off 切换。"
-        + "\n/voice tone 查看音色，/voice sample 试听，/voice fish 音色链接或ID 使用 Fish Audio 现有音色。"
+        + "\n/voice sample excited|soft|relaxed|curious 试听语气，/voice expression on|off 切换自动语气。"
+        + "\n/voice fish 音色链接或ID 使用 Fish Audio 现有音色。"
     )
