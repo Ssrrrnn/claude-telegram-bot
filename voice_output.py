@@ -2,8 +2,12 @@
 import asyncio
 import io
 import os
+import random
 import re
+import time
+from datetime import datetime
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 MODE_KEY = "voice_reply_mode_v1"
 PROFILE_KEY = "voice_profile_v1"
@@ -12,6 +16,8 @@ CUSTOM_VOICE_KEY = "voice_custom_uri_v1"
 FISH_VOICE_KEY = "voice_fish_id_v1"
 FISH_EXPRESSION_KEY = "voice_fish_expression_v1"
 DEFAULT_MODE = "auto"
+AUTO_LAST_SENT_KEY = "voice_auto_last_sent_at_v1"
+AUTO_COOLDOWN_SECONDS = 40 * 60
 COSYVOICE_API_KEY = os.getenv("COSYVOICE_API_KEY", "").strip()
 COSYVOICE_API_URL = "https://api.siliconflow.cn/v1/audio/speech"
 COSYVOICE_MODEL = "FunAudioLLM/CosyVoice2-0.5B"
@@ -74,6 +80,8 @@ def backend(get_setting, chat_id):
 
 
 def wants_audio(current_mode, *, from_voice=False, user_text="", proactive=False):
+    if re.search(r"(?:不要|别|不用|不想|只要文字|只用文字|打字).{0,8}(?:语音|声音)|(?:语音|声音).{0,8}(?:不要|别发|不用)", user_text):
+        return False
     if current_mode == "off":
         return False
     if current_mode == "on":
@@ -86,6 +94,42 @@ def wants_audio(current_mode, *, from_voice=False, user_text="", proactive=False
         r"|(?:想听|要听)(?:你|一下你)?.{0,6}(?:说话|声音)",
         user_text,
     ))
+
+
+def auto_spontaneous(get_setting, chat_id, *, user_text="", reply_text="", proactive=False,
+                     unanswered=False, now=None, chance=None):
+    """Let auto occasionally speak naturally while avoiding late or repeated voice notes."""
+    if unanswered or not clean_speech(reply_text) or len(reply_text) > 180:
+        return False
+    if re.search(r"(?:不要|别|不用|不想).{0,8}(?:语音|声音)|只(?:要|用)(?:文字|打字)|(?:语音|声音).{0,8}(?:不要|别发|不用)", user_text):
+        return False
+    if not proactive and re.search(r"(?:几点|几号|日期|计算|翻译|代码|怎么设置|如何配置|为什么报错)", user_text):
+        return False
+    local = now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    if local.hour < 8 or (local.hour == 8 and local.minute < 30) or (local.hour == 0 and local.minute >= 30):
+        return False
+    try:
+        last = int(get_setting(chat_id, AUTO_LAST_SENT_KEY) or 0)
+    except (TypeError, ValueError):
+        last = 0
+    except Exception as exc:
+        print(f"Auto voice state unavailable: {type(exc).__name__}", flush=True)
+        return False
+    if last and local.timestamp() - last < AUTO_COOLDOWN_SECONDS:
+        return False
+    affectionate = bool(re.search(
+        r"想你|喜欢你|爱你|抱抱|亲亲|委屈|难过|心疼|累了|好累|烦死|开心|高兴|晚安|失眠|生日|想听|陪我",
+        user_text + reply_text,
+    ))
+    probability = (0.30 if proactive else 0.40) if affectionate else (0.09 if proactive else 0.16)
+    return (random.random() if chance is None else chance) < probability
+
+
+def record_auto_voice(set_setting, chat_id, *, sent_at=None):
+    try:
+        set_setting(chat_id, AUTO_LAST_SENT_KEY, str(int(sent_at if sent_at is not None else time.time())))
+    except Exception as exc:
+        print(f"Auto voice cooldown save skipped: {type(exc).__name__}", flush=True)
 
 
 def clean_speech(text):
@@ -480,7 +524,7 @@ async def voice_command(update, context, *, get_setting, set_setting):
     current = mode(get_setting, chat_id)
     await update.message.reply_text(
         {"off": "语音回复已关闭，继续用文字聊天。",
-         "auto": "语音已设为自动：你发语音或明确要语音时，我回语音；其他时候回文字。",
+         "auto": "语音已设为自动：你发语音或明确要语音时，我会回语音；平时也会看聊天气氛偶尔主动发语音，不会连着刷屏。",
          "on": "语音回复已开启：适合的短回复会发语音；长回复或合成失败时回文字。"}[current]
         + "\n用 /voice on、/voice auto、/voice off 切换。"
         + "\n/voice sample excited|soft|relaxed|curious 试听语气，/voice expression on|off 切换自动语气。"
