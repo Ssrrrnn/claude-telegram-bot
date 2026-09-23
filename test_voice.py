@@ -252,6 +252,43 @@ class VoiceDeliveryTests(unittest.TestCase):
             self.assertEqual(voice_output.fish_voice(lambda chat, key: "other-id" if key == voice_output.FISH_VOICE_KEY else None, 7), "other-id")
             self.assertEqual(voice_output.backend(lambda chat, key: "edge" if key == voice_output.BACKEND_KEY else None, 7), "edge")
 
+    def test_fish_emotion_tags_are_sparse(self):
+        self.assertEqual(voice_output.fish_auto_expression("太好了！今天这事终于成了。"), "excited")
+        self.assertEqual(voice_output.fish_auto_expression("辛苦了。先缓一缓。"), "soft tone")
+        self.assertEqual(voice_output.fish_auto_expression("后来呢？"), "curious")
+        self.assertEqual(voice_output.fish_auto_expression("你回来了。今天怎么样？"), "")
+
+    def test_fish_emotion_is_only_sent_to_tts_not_shown_in_caption(self):
+        spoken, captions = [], []
+
+        class Bot:
+            async def send_voice(self, **kwargs):
+                captions.append(kwargs["caption"])
+
+        async def fake_synthesis(text, voice_profile="natural", provider="edge", custom_voice=""):
+            spoken.append((text, custom_voice))
+            return b"mp3"
+
+        def setting(chat, key):
+            return {voice_output.BACKEND_KEY: "fish", voice_output.FISH_VOICE_KEY: "existing-voice"}.get(key)
+
+        fake_telegram = types.SimpleNamespace(InputFile=lambda stream, filename: stream)
+        with patch.dict(sys.modules, {"telegram": fake_telegram}), patch.object(voice_output, "synthesize", fake_synthesis), patch.object(voice_output, "FISH_API_KEY", "test-key"):
+            self.assertTrue(asyncio.run(voice_output.send_voice(Bot(), 7, "太好了！", get_setting=setting)))
+        self.assertEqual(spoken[0], ("[excited] 太好了！", "existing-voice"))
+        self.assertEqual(captions[0], "太好了！")
+
+        def disabled(chat, key):
+            if key == voice_output.FISH_EXPRESSION_KEY:
+                return "off"
+            return setting(chat, key)
+
+        with patch.dict(sys.modules, {"telegram": fake_telegram}), patch.object(voice_output, "synthesize", fake_synthesis), patch.object(voice_output, "FISH_API_KEY", "test-key"):
+            self.assertTrue(asyncio.run(voice_output.send_voice(Bot(), 7, "太好了！", get_setting=disabled)))
+            self.assertTrue(asyncio.run(voice_output.send_voice(Bot(), 7, "太好了！", get_setting=disabled, fish_cue="soft tone")))
+        self.assertEqual(spoken[1][0], "太好了！")
+        self.assertEqual(spoken[2][0], "[soft tone] 太好了！")
+
 
 if __name__ == "__main__":
     unittest.main()
