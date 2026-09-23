@@ -147,6 +147,66 @@ class VoiceDeliveryTests(unittest.TestCase):
         self.assertEqual(sent["data"]["text"], "今天天气不错")
         self.assertEqual(sent["files"]["file"], ("sample.mp3", b"audio", "audio/mpeg"))
 
+    def test_fish_clone_creates_private_reusable_voice_without_transcript(self):
+        sent = {}
+
+        class Response:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"_id": "fish-voice-id", "state": "trained"}
+
+        class Client:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def post(self, url, **kwargs):
+                sent.update(url=url, **kwargs)
+                return Response()
+
+        with patch.dict(sys.modules, {"httpx": types.SimpleNamespace(AsyncClient=Client)}), patch.object(voice_output, "FISH_API_KEY", "test-key"):
+            voice_id = asyncio.run(voice_output.upload_fish_voice(b"audio", "sample.mp3", "audio/mpeg", "qinche"))
+        self.assertEqual(voice_id, "fish-voice-id")
+        self.assertEqual(sent["data"]["visibility"], "private")
+        self.assertEqual(sent["files"]["voices"], ("sample.mp3", b"audio", "audio/mpeg"))
+
+    def test_fish_synthesis_uses_saved_voice_id(self):
+        sent = {}
+
+        class Response:
+            content = b"mp3 bytes"
+            headers = {"content-type": "audio/mpeg"}
+
+            def raise_for_status(self):
+                pass
+
+        class Client:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def post(self, url, **kwargs):
+                sent.update(url=url, **kwargs)
+                return Response()
+
+        with patch.dict(sys.modules, {"httpx": types.SimpleNamespace(AsyncClient=Client)}), patch.object(voice_output, "FISH_API_KEY", "test-key"):
+            audio = asyncio.run(voice_output.synthesize("在呢", "custom", "fish", "fish-voice-id"))
+        self.assertEqual(audio, b"mp3 bytes")
+        self.assertEqual(sent["headers"]["model"], voice_output.FISH_MODEL)
+        self.assertEqual(sent["json"]["reference_id"], "fish-voice-id")
+
 
 if __name__ == "__main__":
     unittest.main()
