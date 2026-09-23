@@ -392,7 +392,7 @@ async def fixed_post_init(application) -> None:
         "possessive_style=warm_dark_attached; romantic_partner_mode=on; "
         "assistant_tone_retry=on; respect_repair_guard=on; "
         "continuity=source_backed_24h; followup=reasoned_once; memory_correction=on; "
-        "ellipsis=blocked; voice=off",
+        "ellipsis=blocked; voice=optional_edge_tts",
         flush=True,
     )
 
