@@ -9,6 +9,7 @@ import runner
 import proactive_policy as policy
 import continuity
 import voice_output
+import qq_connector
 
 
 # -----------------------------
@@ -400,12 +401,21 @@ async def _proactive_tick(application):
                          (voice_mode == "auto" and voice_output.auto_spontaneous(
                              runner.memory_pg.get_setting, chat_id, reply_text=text,
                              proactive=True, unanswered=state["silence_count"] > 0)))
-        sent_as_voice = send_as_voice and await voice_output.send_voice(
-            application.bot, chat_id, text, get_setting=runner.memory_pg.get_setting)
+        platform = read(qq_connector.PLATFORM_KEY) or "telegram"
+        if platform == "qq":
+            connector = application.bot_data.get("qq_connector")
+            if connector is None:
+                raise RuntimeError("QQ proactive connector unavailable")
+            sent_as_voice = await connector.send_proactive(
+                text, strict_split_bubbles(text), as_voice=send_as_voice,
+            )
+        else:
+            sent_as_voice = send_as_voice and await voice_output.send_voice(
+                application.bot, chat_id, text, get_setting=runner.memory_pg.get_setting)
+            if not sent_as_voice:
+                await _send_bubbles_to_chat(application, chat_id, text)
         if sent_as_voice and voice_mode == "auto":
             voice_output.record_auto_voice(runner.memory_pg.set_setting, chat_id)
-        if not sent_as_voice:
-            await _send_bubbles_to_chat(application, chat_id, text)
         sent_at = int(time.time())
         replied_during_send = int(read(KEY_LAST_USER_AT) or 0) != last_user_at
         state.update(last_proactive_content=text, last_proactive_type=kind,
