@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 import psycopg
+import continuity
 from psycopg.rows import dict_row
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
@@ -22,6 +23,46 @@ def _connect():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured")
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+
+def mutate_continuity(chat_id, operation):
+    """Serialize state changes with a row lock, including overlapping deploys."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO bot_settings(chat_id,key,value) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                        (chat_id, continuity.KEY, json.dumps(continuity.empty())))
+            cur.execute("SELECT value FROM bot_settings WHERE chat_id=%s AND key=%s FOR UPDATE", (chat_id, continuity.KEY))
+            state = operation(continuity.decode(cur.fetchone()["value"]))
+            cur.execute("UPDATE bot_settings SET value=%s WHERE chat_id=%s AND key=%s",
+                        (json.dumps(state, ensure_ascii=False), chat_id, continuity.KEY))
+        conn.commit()
+    return state
+
+
+def correct_memory(chat_id, memory_id, replacement=None):
+    """Update exactly one owned memory and record its superseded text atomically."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO bot_settings(chat_id,key,value) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                        (chat_id, continuity.KEY, json.dumps(continuity.empty())))
+            cur.execute("SELECT value FROM bot_settings WHERE chat_id=%s AND key=%s FOR UPDATE", (chat_id, continuity.KEY))
+            state = continuity.decode(cur.fetchone()["value"])
+            cur.execute("SELECT text FROM memories WHERE chat_id=%s AND id=%s FOR UPDATE", (chat_id, memory_id))
+            row = cur.fetchone()
+            if not row:
+                return False
+            state["revision"] = -int(time.time() * 1000)
+            state["corrections"] = [*state["corrections"], {"memory_id": memory_id, "old": row["text"],
+                "replacement": replacement, "at": time.time()}][-100:]
+            if replacement is None:
+                cur.execute("DELETE FROM memories WHERE chat_id=%s AND id=%s", (chat_id, memory_id))
+            else:
+                cur.execute("UPDATE memories SET text=%s, kind='manual', source_message_id=NULL WHERE chat_id=%s AND id=%s",
+                            (replacement, chat_id, memory_id))
+            cur.execute("UPDATE bot_settings SET value=%s WHERE chat_id=%s AND key=%s",
+                        (json.dumps(state, ensure_ascii=False), chat_id, continuity.KEY))
+        conn.commit()
+    return True
 
 
 def init_db(retries: int = 12) -> None:
@@ -272,15 +313,7 @@ def list_memories(chat_id: int, limit: int = 30) -> list[dict[str, Any]]:
 
 
 def delete_memory(chat_id: int, memory_id: int) -> bool:
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM memories WHERE chat_id = %s AND id = %s",
-                (chat_id, memory_id),
-            )
-            changed = cur.rowcount > 0
-        conn.commit()
-    return changed
+    return correct_memory(chat_id, memory_id)
 
 
 def clear_memories(chat_id: int) -> None:
@@ -535,11 +568,13 @@ async def analyze_and_store(
     user_text: str,
     assistant_text: str,
     recent_history: list[dict[str, Any]],
+    allow_long_term: bool = True,
 ) -> None:
     user_text = (user_text or "").strip()
     if not user_text or user_text.startswith("/"):
         return
     current_relationship = get_relationship(chat_id) or "尚无稳定关系摘要。"
+    current_continuity = continuity.decode(get_setting(chat_id, continuity.KEY))
     compact_history = []
     for item in recent_history[-10:]:
         role = item.get("role")
@@ -571,27 +606,52 @@ async def analyze_and_store(
 JSON 格式：
 {"memories":[{"kind":"fact","text":"...","importance":2}],"relationship_state":"...或null","favorite":false,"note":null}"""
 
+    system += """\n额外输出 continuity 对象，用于24小时内的对话续接，不属于长期记忆。
+格式：{"topic":"当前正在延续的话题与情绪，简短且只写明确事实", "threads":[{"action":"open或done或cancelled", "id":"更新旧事项时使用已存在id，新事项留空", "title":"具体未完事项或明确承诺", "purpose":"晚点为什么值得回访", "category":"work或other", "subject":"user或assistant或shared", "realm":"real或roleplay", "evidence":"必须逐字引用当前用户消息或当前assistant_reply中的一段原话，至少4字", "delay_minutes":90}]}
+只记录有明确依据且尚未完成的事项，不把寒暄、情话、泛泛的陪伴承诺当待办。
+用户表示完成、取消、下班或不再需要时关闭相关旧事项；完成证据必须出自用户当前原话。
+用户简短回复‘好了’‘解决了’时，可引用整条短消息作为完成证据，但必须能从上下文确定具体旧事项id。
+相同事项沿用id，不创建同义重复。不会执行闹钟和工具任务，这些只是对话回访线索。
+现实与角色剧情分开，不把角色自述当用户事实。已完成事项不要重新打开。
+临时情绪写topic，不写长期memories。current_continuity中的纠错优先于历史内容，禁止重新存回作废内容。
+allow_long_term=false时memories必须为[]、relationship_state为null，但仍可整理continuity与判断favorite。"""
     user_payload = {
+        "current_continuity": current_continuity,
+        "allow_long_term": allow_long_term,
         "current_relationship": current_relationship,
         "recent_history": compact_history,
         "current_user_message": user_text[:4000],
         "assistant_reply": (assistant_text or "")[:4000],
     }
-    result = await _analyzer_call(
+    result = await asyncio.wait_for(_analyzer_call(
         [
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ]
-    )
+    ), timeout=20)
     if not result:
         return
 
+    applied = False
+    def update_state(state):
+        nonlocal applied
+        if state["revision"] != telegram_message_id:
+            return state
+        applied = True
+        return continuity.apply_analysis(state, result.get("continuity"), user_text, assistant_text,
+                                         telegram_message_id, time.time())
+    current_continuity = mutate_continuity(chat_id, update_state)
+    if not applied:
+        return  # A newer message/correction arrived while the analyzer ran.
+
     memories = result.get("memories")
-    if isinstance(memories, list):
+    if allow_long_term and isinstance(memories, list):
         for item in memories[:1]:
             if not isinstance(item, dict):
                 continue
             text = str(item.get("text") or "").strip()
+            if continuity.blocked_memory(current_continuity, text):
+                continue
             kind = str(item.get("kind") or "fact").strip().lower()
             if kind not in {"fact", "preference", "promise", "event", "relationship"}:
                 kind = "fact"
@@ -620,7 +680,7 @@ JSON 格式：
             )
 
     relationship = result.get("relationship_state")
-    if isinstance(relationship, str) and relationship.strip().lower() not in {"null", "none"}:
+    if allow_long_term and isinstance(relationship, str) and relationship.strip().lower() not in {"null", "none"} and not continuity.blocked_memory(current_continuity, relationship):
         set_relationship(chat_id, relationship)
 
     if result.get("favorite") is True:

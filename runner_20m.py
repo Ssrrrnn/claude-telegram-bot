@@ -391,6 +391,7 @@ async def fixed_post_init(application) -> None:
         "favorites=backend_silent; emotion_state=possessive_persistent; "
         "possessive_style=warm_dark_attached; romantic_partner_mode=on; "
         "assistant_tone_retry=on; respect_repair_guard=on; "
+        "continuity=source_backed_24h; followup=reasoned_once; memory_correction=on; "
         "ellipsis=blocked; voice=off",
         flush=True,
     )

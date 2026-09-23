@@ -9,6 +9,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 
 import bot
 import memory_pg
+import continuity
 
 # Default to chat-bubble mode instead of live-edit streaming.
 bot.stream_preferences = defaultdict(lambda: False)
@@ -58,6 +59,10 @@ def build_system_prompt_pg(chat_id: int) -> str:
             + memory_text
         )
 
+    try:
+        blocks.append(continuity.prompt_block(memory_pg, chat_id))
+    except Exception as exc:
+        print(f"Continuity context skipped: {type(exc).__name__}", flush=True)
     return "\n\n".join(blocks)
 
 
@@ -316,6 +321,33 @@ async def handle_text_with_memory(update, context) -> None:
         except Exception as exc:
             print(f"Recent conversation restore skipped: {type(exc).__name__}", flush=True)
 
+    try:
+        continuity.receive(memory_pg, chat_id, user_text, update.message.message_id)
+    except Exception as exc:
+        print(f"Continuity state skipped: {type(exc).__name__}", flush=True)
+
+    request = continuity.memory_request(user_text)
+    if request:
+        try:
+            action, memory_id, replacement = request
+            if action in ("list", "clarify"):
+                rows = memory_pg.list_memories(chat_id, 20)
+                reply = ("你指的是哪一条？告诉我编号就好。\n" if action == "clarify" else "我记着这些：\n")
+                reply += "\n".join(f"#{row['id']} {row['text']}" for row in rows) or "目前没有已保存的长期记忆。"
+                reply += "\n可以说：忘掉记忆 #编号，或：纠正记忆 #编号：正确内容。"
+            else:
+                changed = memory_pg.correct_memory(chat_id, memory_id, replacement)
+                reply = (("这条长期记忆已移除，聊天记录仍保留。" if action == "delete" else "记好了，这条按你刚才纠正的内容来。")
+                         if changed else "没找到这个编号，发‘查看记忆’可以看看。")
+            await bot.safe_reply(update, reply)
+            bot.histories[chat_id].extend([{"role": "user", "content": user_text}, {"role": "assistant", "content": reply}])
+            bot.histories[chat_id] = bot.histories[chat_id][-bot.MAX_HISTORY_MESSAGES:]
+            memory_pg.save_recent_turn(chat_id, update.message.message_id, user_text, reply)
+        except Exception as exc:
+            print(f"Memory management failed: {type(exc).__name__}", flush=True)
+            await bot.safe_reply(update, "这次记忆操作没有确认成功，请稍后再试。")
+        return
+
     _active_query[chat_id] = user_text
     entry = {"role": "user", "content": user_text}
     try:
@@ -326,7 +358,7 @@ async def handle_text_with_memory(update, context) -> None:
     assistant_text = ""
     if bot.histories[chat_id]:
         last = bot.histories[chat_id][-1]
-        if last.get("role") == "assistant" and isinstance(last.get("content"), str):
+        if len(bot.histories[chat_id]) >= 2 and bot.histories[chat_id][-2] is entry and last.get("role") == "assistant" and isinstance(last.get("content"), str):
             assistant_text = last["content"]
 
     if assistant_text:
@@ -340,10 +372,11 @@ async def handle_text_with_memory(update, context) -> None:
         except Exception as exc:
             print(f"Recent conversation save skipped: {type(exc).__name__}", flush=True)
 
+    if not assistant_text:
+        return
     should_analyze, reason = _should_run_memory_analyzer(chat_id, user_text)
     if not should_analyze:
-        print(f"Memory analyzer skipped: chat_id={chat_id}, reason={reason}", flush=True)
-        return
+        print(f"Long-term memory update skipped; continuity only: chat_id={chat_id}, reason={reason}", flush=True)
 
     recent = list(bot.histories[chat_id][-12:])
 
@@ -356,6 +389,7 @@ async def handle_text_with_memory(update, context) -> None:
                 user_text=user_text,
                 assistant_text=assistant_text,
                 recent_history=recent,
+                allow_long_term=should_analyze,
             )
         except Exception as exc:
             print(f"Background memory error: {exc!r}", flush=True)
@@ -375,6 +409,7 @@ async def reset_with_persistent_context(update, context) -> None:
         return
     try:
         memory_pg.clear_recent_messages(chat_id)
+        memory_pg.mutate_continuity(chat_id, continuity.reset_transient)
     except Exception as exc:
         print(f"Persistent context reset failed: {type(exc).__name__}", flush=True)
         await update.message.reply_text("短期上下文暂时无法清空，请稍后再试。")

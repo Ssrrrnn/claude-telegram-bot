@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import runner
 import proactive_policy as policy
+import continuity
 
 
 # -----------------------------
@@ -295,12 +296,19 @@ async def _send_bubbles_to_chat(application, chat_id, text):
 
 
 async def _generate_proactive_message(chat_id, state):
+    context_state = continuity.load(runner.memory_pg, chat_id)
+    followup = continuity.due_followup(context_state, time.time())
+    if not runner.bot.histories[chat_id] and hasattr(runner.memory_pg, "load_recent_messages"):
+        runner.bot.histories[chat_id] = runner.memory_pg.load_recent_messages(chat_id, runner.bot.MAX_HISTORY_MESSAGES)
     recent = list(runner.bot.histories[chat_id][-8:])
     sent = state["recent"][-12:]
     kind = policy.choose_type(_now_local(), [x["type"] for x in sent], state["silence_count"])
+    if followup:
+        kind = "回访:" + followup["id"]
     trigger = (
         "【后台主动联系事件，不是用户发送的消息】\n"
         "以当前角色本人主动联系，不提后台、提醒、定时或这段指令。保持既有人格。"
+        "先判断现在是否适合联系；如果没有值得说的、用户正在休息或会重复打扰，只输出 NO_REPLY。"
         f"本次方向：{kind}。连续未回复的主动联系次数：{state['silence_count']}。"
         "结合真实聊天、记忆和当前北京时间写1至3句短消息。"
         "沉默不等于新的回复，不要假装用户回答了，也不要重复追问忙不忙、在干嘛。"
@@ -311,6 +319,10 @@ async def _generate_proactive_message(chat_id, state):
         "以下是已经发过的消息，只用于避重，禁止照抄或近义改写：\n"
         + json.dumps(sent, ensure_ascii=False)
     )
+    trigger += "\n" + continuity.prompt_block(runner.memory_pg, chat_id)
+    if followup:
+        trigger += "\n本次回访的明确原因（仅在仍有必要时联系）：" + json.dumps(followup, ensure_ascii=False)
+        trigger += "\n只自然接起这件事，不编造进展。你并没有替用户完成任务。"
     previous = [x["content"] for x in sent]
     for attempt in range(3):
         instruction = trigger
@@ -320,6 +332,8 @@ async def _generate_proactive_message(chat_id, state):
             chat_id, [*recent, {"role": "user", "content": instruction}],
             runner.bot.current_model(chat_id),
         )
+        if text and text.strip().strip('`').strip() == "NO_REPLY":
+            return "", kind
         if text and not policy.is_repetition(text, previous):
             return text.strip(), kind
         if text:
@@ -342,9 +356,19 @@ async def _proactive_tick(application):
         _schedule_from_now(chat_id)
         return
     if now < next_at:
-        return
+        # A newly extracted follow-up may become due before the older random
+        # check. Honor its reason while retaining the 20-minute contact floor.
+        pending = continuity.due_followup(continuity.load(runner.memory_pg, chat_id), now)
+        last_contact = max(int(read(KEY_LAST_USER_AT) or 0), int(read(KEY_LAST_PROACTIVE_AT) or 0))
+        if not pending or now - last_contact < PROACTIVE_MIN_SECONDS:
+            return
     if _is_quiet_time():
         runner.memory_pg.set_setting(chat_id, KEY_NEXT_AT, str(int(_next_after_quiet())))
+        return
+    continuity_state = continuity.load(runner.memory_pg, chat_id)
+    status = continuity_state["status"]
+    if status.get("value") == "已说晚安，暂停主动打扰" and status.get("expires_at", 0) > now:
+        runner.memory_pg.set_setting(chat_id, KEY_NEXT_AT, str(int(status["expires_at"])))
         return
     # Serialize with normal replies; incoming text is recorded before generation.
     async with runner.bot.chat_locks[chat_id]:
@@ -360,12 +384,16 @@ async def _proactive_tick(application):
             _schedule_from_now(chat_id)
             return
         if not text:
-            print(f"Proactive skipped: chat_id={chat_id}, reason=repetition", flush=True)
+            print(f"Proactive skipped: chat_id={chat_id}, reason=no_contact_or_repetition", flush=True)
             _schedule_from_now(chat_id)
+            if kind.startswith("回访:"):
+                continuity.defer_followup(runner.memory_pg, chat_id, kind.split(":", 1)[1], int(read(KEY_NEXT_AT)))
             return
         # Persist a cooldown BEFORE delivery. If Telegram times out after accepting
         # a bubble, do not immediately retry the same message on the next tick.
         _schedule_from_now(chat_id)
+        if kind.startswith("回访:") and not continuity.claim_followup(runner.memory_pg, chat_id, kind.split(":", 1)[1]):
+            return
         await _send_bubbles_to_chat(application, chat_id, text)
         sent_at = int(time.time())
         replied_during_send = int(read(KEY_LAST_USER_AT) or 0) != last_user_at
