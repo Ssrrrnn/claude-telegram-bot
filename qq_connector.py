@@ -5,11 +5,14 @@ import base64
 from io import BytesIO
 import json
 import os
+import random
+import time
 import uuid
 from urllib.parse import urlsplit, urlunsplit
 
 from qq_gateway import QQGateway
 from qq_face_names import FACE_NAMES
+import qq_stickers
 
 OWNER_KEY = "qq_owner_uin_v1"
 PLATFORM_KEY = "last_active_platform_v1"
@@ -124,6 +127,7 @@ class QQConnector:
         self.gateway = None
         self.gateway_uin = None
         self.ws = None
+        self.owner_event_lock = asyncio.Lock()
 
     def owner_uin(self):
         configured = os.getenv("QQ_OWNER_UIN", "").strip()
@@ -155,6 +159,48 @@ class QQConnector:
         if not isinstance(text, str) or not text:
             return
         await self.action(ws, "send_private_msg", {"user_id": int(sender), "message": text})
+
+    async def _send_market_sticker(self, ws, sender, sticker):
+        await self.action(ws, "send_private_msg", {
+            "user_id": int(sender), "message": [{"type": "mface", "data": sticker}],
+        })
+
+    async def _remember_stickers(self, event):
+        raw = self.memory.get_setting(self.owner_chat_id, qq_stickers.SETTING_KEY)
+        stickers, changed = qq_stickers.remember(raw, event)
+        if changed:
+            self.memory.set_setting(self.owner_chat_id, qq_stickers.SETTING_KEY,
+                                    json.dumps(stickers, ensure_ascii=False))
+        return stickers
+
+    async def _maybe_send_sticker(self, ws, sender, user_text, replies, stickers, *, incoming_sticker=False):
+        requested = qq_stickers.explicit_request(user_text)
+        if not stickers or incoming_sticker and not requested:
+            return False
+        if requested:
+            candidates = stickers
+        else:
+            if len(stickers) < 2:
+                return False
+            last = self.memory.get_setting(self.owner_chat_id, qq_stickers.LAST_SENT_KEY)
+            try:
+                if time.time() - float(last or 0) < qq_stickers.SPONTANEOUS_COOLDOWN:
+                    return False
+            except (TypeError, ValueError):
+                pass
+            if random.random() >= 0.12:
+                return False
+            answer = " ".join(reply.get("text", "") for reply in replies if reply.get("type") == "text")
+            candidates = qq_stickers.fitting_stickers(stickers, answer)
+        if not candidates:
+            return False
+        try:
+            await self._send_market_sticker(ws, sender, random.choice(candidates))
+            self.memory.set_setting(self.owner_chat_id, qq_stickers.LAST_SENT_KEY, str(time.time()))
+            return True
+        except Exception as exc:
+            print(f"QQ sticker delivery skipped: {type(exc).__name__}", flush=True)
+            return False
 
     async def _send_replies(self, ws, sender, replies):
         for reply in replies:
@@ -230,12 +276,21 @@ class QQConnector:
         if text == "绑定 " + self.pair_code:
             await self._send_text(ws, sender, "已经连上了。")
             return
+        async with self.owner_event_lock:
+            await self._handle_owner_message(ws, event, sender, owner)
+
+    async def _handle_owner_message(self, ws, event, sender, owner):
         message_id = event.get("message_id")
         if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
             return
         text, images = _message_parts(event)
         if not text or len(text) > MAX_MESSAGE_CHARS:
             return
+        try:
+            stickers = await self._remember_stickers(event)
+        except Exception as exc:
+            print(f"QQ sticker library skipped: {type(exc).__name__}", flush=True)
+            stickers = []
         image_base64 = image_mime = None
         if images:
             try:
@@ -250,8 +305,18 @@ class QQConnector:
             response = await self._gateway(owner).process({
                 "sender_id": sender, "message_id": message_id, "text": text,
                 "image_base64": image_base64, "image_mime": image_mime,
+                "qq_sticker_status": ("available" if stickers else "empty")
+                if qq_stickers.explicit_request(text) else None,
             })
             await self._send_replies(ws, sender, response["replies"])
+            if not response.get("duplicate"):
+                sent = await self._maybe_send_sticker(
+                    ws, sender, text, response["replies"], stickers,
+                    incoming_sticker=any(segment.get("type") == "mface" for segment in event.get("message", [])
+                                         if isinstance(segment, dict)),
+                )
+                if qq_stickers.explicit_request(text) and stickers and not sent:
+                    await self._send_text(ws, sender, "这张表情包没发出去。我先收好，稍后再试。")
         except Exception as exc:
             print(f"QQ message handling failed: {type(exc).__name__}", flush=True)
 
