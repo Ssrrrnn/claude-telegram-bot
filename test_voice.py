@@ -207,6 +207,41 @@ class VoiceDeliveryTests(unittest.TestCase):
         self.assertEqual(sent["headers"]["model"], voice_output.FISH_MODEL)
         self.assertEqual(sent["json"]["reference_id"], "fish-voice-id")
 
+    def test_existing_fish_voice_link_extracts_model_id(self):
+        model_id = "09af743d3e16464ba4d0f3b7f0e12fd5"
+        self.assertEqual(voice_output.fish_voice_id(f"https://fish.audio/m/{model_id}/?share=true"), model_id)
+        self.assertEqual(voice_output.fish_voice_id(model_id), model_id)
+        self.assertEqual(voice_output.fish_voice_id("https://other.example/m/" + model_id), "")
+        self.assertEqual(voice_output.fish_voice_id("not-a-model-id"), "")
+
+    def test_existing_fish_voice_is_checked_before_selection(self):
+        sent = {}
+
+        class Response:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"_id": "abc", "state": "trained"}
+
+        class Client:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def get(self, url, **kwargs):
+                sent.update(url=url, **kwargs)
+                return Response()
+
+        with patch.dict(sys.modules, {"httpx": types.SimpleNamespace(AsyncClient=Client)}), patch.object(voice_output, "FISH_API_KEY", "test-key"):
+            asyncio.run(voice_output.verify_fish_voice("09af743d3e16464ba4d0f3b7f0e12fd5"))
+        self.assertEqual(sent["url"], "https://api.fish.audio/model/09af743d3e16464ba4d0f3b7f0e12fd5")
+
 
 if __name__ == "__main__":
     unittest.main()

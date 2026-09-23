@@ -3,6 +3,7 @@ import asyncio
 import io
 import os
 import re
+from urllib.parse import urlparse
 
 MODE_KEY = "voice_reply_mode_v1"
 PROFILE_KEY = "voice_profile_v1"
@@ -221,6 +222,32 @@ async def upload_fish_voice(raw, filename, mime, name):
         return voice_id
 
 
+def fish_voice_id(value):
+    """Accept a Fish model ID or its public/share page URL."""
+    candidate = value.strip()
+    if candidate.startswith("https://"):
+        url = urlparse(candidate)
+        if url.hostname not in ("fish.audio", "www.fish.audio"):
+            return ""
+        match = re.fullmatch(r"/m/([a-fA-F0-9]{24,40})/?", url.path)
+        return match.group(1).lower() if match else ""
+    return candidate.lower() if re.fullmatch(r"[a-fA-F0-9]{24,40}", candidate) else ""
+
+
+async def verify_fish_voice(voice_id):
+    import httpx
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.get(
+            f"https://api.fish.audio/model/{voice_id}",
+            headers={"Authorization": f"Bearer {FISH_API_KEY}"},
+        )
+        response.raise_for_status()
+        result = response.json()
+        if result.get("state") == "failed":
+            raise ValueError("Fish Audio voice is unavailable")
+
+
 async def voice_command(update, context, *, get_setting, set_setting):
     if not update.message:
         return
@@ -231,6 +258,28 @@ async def voice_command(update, context, *, get_setting, set_setting):
         return
     args = getattr(context, "args", [])
     option = args[0].lower() if args else ""
+    if option == "fish":
+        if not FISH_API_KEY:
+            await update.message.reply_text("先在 Railway 配置 FISH_API_KEY，才能使用 Fish Audio 的现有音色。")
+            return
+        voice_id = fish_voice_id(args[1]) if len(args) > 1 else ""
+        if not voice_id:
+            await update.message.reply_text(
+                "打开 Fish Audio 里选好的音色，复制分享链接或音色 ID，然后发："
+                "\n/voice fish 音色链接或ID"
+            )
+            return
+        try:
+            await verify_fish_voice(voice_id)
+        except Exception as exc:
+            print(f"Fish Audio voice lookup skipped: {type(exc).__name__}", flush=True)
+            await update.message.reply_text("无法读取这个音色。请检查 Fish Audio 链接、API 密钥和音色访问权限。")
+            return
+        set_setting(chat_id, FISH_VOICE_KEY, voice_id)
+        set_setting(chat_id, BACKEND_KEY, "fish")
+        set_setting(chat_id, PROFILE_KEY, "custom")
+        await update.message.reply_text("Fish Audio 音色已选中。发 /voice sample 试听。")
+        return
     if option == "clone" and len(args) > 1 and args[1].lower() == "fish":
         if not FISH_API_KEY:
             await update.message.reply_text("先在 Railway 配置 FISH_API_KEY，再创建 Fish Audio 音色。")
@@ -371,5 +420,5 @@ async def voice_command(update, context, *, get_setting, set_setting):
          "auto": "语音已设为自动：你发语音或明确要语音时，我回语音；其他时候回文字。",
          "on": "语音回复已开启：适合的短回复会发语音；长回复或合成失败时回文字。"}[current]
         + "\n用 /voice on、/voice auto、/voice off 切换。"
-        + "\n/voice tone 查看音色，/voice sample 试听，/voice clone fish myvoice 创建 Fish Audio 音色。"
+        + "\n/voice tone 查看音色，/voice sample 试听，/voice fish 音色链接或ID 使用 Fish Audio 现有音色。"
     )
