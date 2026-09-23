@@ -2,6 +2,7 @@ import asyncio
 import re
 
 import emotion_pg
+import qq_connector
 import runner_strict_bubbles as app
 
 # Keep the faster proactive cadence without changing the rest of the roleplay,
@@ -375,6 +376,14 @@ async def fixed_post_init(application) -> None:
         print(f"Emotion state init failed; fallback persona only: {exc!r}", flush=True)
 
     await app._original_post_init(application)
+
+    try:
+        await qq_connector.start(
+            application, handler=app.runner.handle_text_with_memory,
+            bot=app.runner.bot, memory=app.runner.memory_pg,
+        )
+    except Exception as exc:
+        print(f"QQ OneBot unavailable: {type(exc).__name__}", flush=True)
 
     task = asyncio.create_task(app.proactive_loop(application), name="proactive-message-loop")
     application.bot_data["proactive_message_task"] = task
