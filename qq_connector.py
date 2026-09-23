@@ -52,6 +52,11 @@ async def _fetch_qq_image(url):
             image = ImageOps.exif_transpose(image)
             image.thumbnail((1536, 1536))
             target = BytesIO()
+            if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+                rgba = image.convert("RGBA")
+                canvas = Image.new("RGB", rgba.size, "white")
+                canvas.paste(rgba, mask=rgba.getchannel("A"))
+                image = canvas
             image.convert("RGB").save(target, format="JPEG", quality=85)
             return base64.b64encode(target.getvalue()).decode("ascii"), "image/jpeg"
     except (UnidentifiedImageError, OSError) as exc:
