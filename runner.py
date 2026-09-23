@@ -11,6 +11,7 @@ import bot
 import memory_pg
 import continuity
 import voice_output
+import qq_connector
 
 # Default to chat-bubble mode instead of live-edit streaming.
 bot.stream_preferences = defaultdict(lambda: False)
@@ -595,6 +596,7 @@ def main() -> None:
         ApplicationBuilder()
         .token(bot.TELEGRAM_BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(qq_connector.stop)
         .build()
     )
     app.add_handler(CommandHandler("start", bot.start))
