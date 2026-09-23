@@ -462,6 +462,7 @@ async def generate_and_send(
             if not (use_voice and await voice_output.send_voice(
                 context.bot, chat_id, answer,
                 reply_to_message_id=update.message.message_id,
+                get_setting=get_setting,
             )):
                 await safe_reply(update, answer)
 
