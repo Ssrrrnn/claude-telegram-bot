@@ -15,6 +15,7 @@ COSYVOICE_API_KEY = os.getenv("COSYVOICE_API_KEY", "").strip()
 COSYVOICE_API_URL = "https://api.siliconflow.cn/v1/audio/speech"
 COSYVOICE_MODEL = "FunAudioLLM/CosyVoice2-0.5B"
 FISH_API_KEY = os.getenv("FISH_API_KEY", "").strip()
+FISH_DEFAULT_VOICE_ID = os.getenv("FISH_DEFAULT_VOICE_ID", "").strip()
 FISH_MODEL = os.getenv("FISH_TTS_MODEL", "s2.1-pro-free").strip()
 # Keep the original timbre. Shifting pitch down by 12 Hz made the former
 # Yunxi default sound processed, particularly on short chat messages.
@@ -38,9 +39,13 @@ def mode(get_setting, chat_id):
     return value if value in ("on", "off", "auto") else DEFAULT_MODE
 
 
+def fish_voice(get_setting, chat_id):
+    return (get_setting(chat_id, FISH_VOICE_KEY) if get_setting else "") or FISH_DEFAULT_VOICE_ID
+
+
 def profile(get_setting, chat_id):
     value = get_setting(chat_id, PROFILE_KEY)
-    if backend(get_setting, chat_id) == "fish" and get_setting(chat_id, FISH_VOICE_KEY):
+    if backend(get_setting, chat_id) == "fish" and fish_voice(get_setting, chat_id):
         return "custom"
     if value == "custom" and backend(get_setting, chat_id) == "cosyvoice" and get_setting(chat_id, CUSTOM_VOICE_KEY):
         return "custom"
@@ -53,6 +58,8 @@ def backend(get_setting, chat_id):
         return "fish"
     if selected == "edge":
         return "edge"
+    if selected is None and FISH_API_KEY and FISH_DEFAULT_VOICE_ID:
+        return "fish"
     if COSYVOICE_API_KEY and selected in (None, "cosyvoice"):
         return "cosyvoice"
     return "edge"
@@ -162,7 +169,8 @@ async def send_voice(bot, chat_id, text, *, reply_to_message_id=None,
         selected = voice_profile or (profile(get_setting, chat_id) if get_setting else DEFAULT_PROFILE)
         selected_backend = provider or (backend(get_setting, chat_id) if get_setting else "edge")
         voice_key = FISH_VOICE_KEY if selected_backend == "fish" else CUSTOM_VOICE_KEY
-        custom_voice = get_setting(chat_id, voice_key) if get_setting else ""
+        custom_voice = (fish_voice(get_setting, chat_id) if selected_backend == "fish" else
+                        get_setting(chat_id, voice_key) if get_setting else "")
         audio = await synthesize(speech, selected, selected_backend, custom_voice or "")
         await bot.send_voice(
             chat_id=chat_id,
@@ -360,7 +368,7 @@ async def voice_command(update, context, *, get_setting, set_setting):
         if selected == "fish" and not FISH_API_KEY:
             await update.message.reply_text("Fish Audio 还没有配置接口密钥。需要先在 Railway 设置 FISH_API_KEY。")
             return
-        if selected == "fish" and not get_setting(chat_id, FISH_VOICE_KEY):
+        if selected == "fish" and not fish_voice(get_setting, chat_id):
             await update.message.reply_text("先用 /voice clone fish myvoice 创建专属音色。")
             return
         if selected == "cosyvoice" and not COSYVOICE_API_KEY:
@@ -381,7 +389,7 @@ async def voice_command(update, context, *, get_setting, set_setting):
             await update.message.reply_text("Fish Audio 使用克隆音色 custom；natural、deep、soft 属于其他语音服务。")
             return
         voice_key = FISH_VOICE_KEY if backend(get_setting, chat_id) == "fish" else CUSTOM_VOICE_KEY
-        if chosen == "custom" and not get_setting(chat_id, voice_key):
+        if chosen == "custom" and not (fish_voice(get_setting, chat_id) if voice_key == FISH_VOICE_KEY else get_setting(chat_id, voice_key)):
             await update.message.reply_text("还没有专属音色。先用 /voice clone 创建。")
         elif chosen in PROFILES or chosen == "custom":
             set_setting(chat_id, PROFILE_KEY, chosen)
@@ -401,7 +409,8 @@ async def voice_command(update, context, *, get_setting, set_setting):
             await update.message.reply_text("Fish Audio 使用克隆音色 custom。发 /voice sample 试听。")
             return
         voice_key = FISH_VOICE_KEY if backend(get_setting, chat_id) == "fish" else CUSTOM_VOICE_KEY
-        if chosen not in PROFILES and not (chosen == "custom" and get_setting(chat_id, voice_key)):
+        saved_voice = fish_voice(get_setting, chat_id) if voice_key == FISH_VOICE_KEY else get_setting(chat_id, voice_key)
+        if chosen not in PROFILES and not (chosen == "custom" and saved_voice):
             await update.message.reply_text("音色可选：natural、deep、soft；创建专属音色后可选 custom。")
             return
         sample = "刚刚听见你的声音了。别急，我在这儿，慢慢跟我说。"

@@ -242,6 +242,16 @@ class VoiceDeliveryTests(unittest.TestCase):
             asyncio.run(voice_output.verify_fish_voice("09af743d3e16464ba4d0f3b7f0e12fd5"))
         self.assertEqual(sent["url"], "https://api.fish.audio/model/09af743d3e16464ba4d0f3b7f0e12fd5")
 
+    def test_railway_default_fish_voice_is_used_without_chat_setup(self):
+        model_id = "7cb18d1a283247f9a2c3771384690f98"
+        settings = lambda chat, key: None
+        with patch.object(voice_output, "FISH_API_KEY", "test-key"), patch.object(voice_output, "FISH_DEFAULT_VOICE_ID", model_id):
+            self.assertEqual(voice_output.backend(settings, 7), "fish")
+            self.assertEqual(voice_output.profile(settings, 7), "custom")
+            self.assertEqual(voice_output.fish_voice(settings, 7), model_id)
+            self.assertEqual(voice_output.fish_voice(lambda chat, key: "other-id" if key == voice_output.FISH_VOICE_KEY else None, 7), "other-id")
+            self.assertEqual(voice_output.backend(lambda chat, key: "edge" if key == voice_output.BACKEND_KEY else None, 7), "edge")
+
 
 if __name__ == "__main__":
     unittest.main()
