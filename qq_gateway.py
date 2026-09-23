@@ -14,8 +14,9 @@ class _Reply:
 
 
 class _Message:
-    def __init__(self, text, message_id, outbox, from_voice=False):
+    def __init__(self, text, message_id, outbox, from_voice=False, image_base64=None, image_mime=None):
         self.text, self.message_id, self.from_voice = text, message_id, from_voice
+        self.image_base64, self.image_mime = image_base64, image_mime
         self.source_platform = "qq"
         self.outbox = outbox
 
@@ -71,11 +72,16 @@ class QQGateway:
             raise ValueError("Invalid QQ message id")
         text = data.get("text")
         audio = data.get("voice_base64")
+        image = data.get("image_base64")
+        image_mime = data.get("image_mime")
         if not isinstance(text, str) or len(text) > 4000 or (audio is not None and not isinstance(audio, str)):
             raise ValueError("Invalid QQ voice contents")
+        if image is not None and (not isinstance(image, str) or len(image) > 5_500_000
+                                  or image_mime not in ("image/jpeg", "image/png", "image/webp")):
+            raise ValueError("Invalid QQ image contents")
         if audio is not None and len(audio) > 8_000_000:
             raise ValueError("QQ voice is too large")
-        if not text.strip() and not audio:
+        if not text.strip() and not audio and not image:
             raise ValueError("Empty QQ message")
 
         async with self.request_lock:
@@ -94,7 +100,8 @@ class QQGateway:
             outbox = []
             update = SimpleNamespace(
                 effective_chat=SimpleNamespace(id=self.shared_chat_id),
-                message=_Message(text.strip(), -message_id, outbox, from_voice=bool(audio)),
+                message=_Message(text.strip(), -message_id, outbox, from_voice=bool(audio),
+                                 image_base64=image, image_mime=image_mime),
             )
             context = SimpleNamespace(bot=_Bot(outbox))
             await self.handler(update, context)

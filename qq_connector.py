@@ -1,25 +1,89 @@
 """Private OneBot WebSocket client for the Railway NapCat service."""
 
 import asyncio
+import base64
+from io import BytesIO
 import json
 import os
 import uuid
+from urllib.parse import urlsplit, urlunsplit
 
 from qq_gateway import QQGateway
+from qq_face_names import FACE_NAMES
 
 OWNER_KEY = "qq_owner_uin_v1"
 PLATFORM_KEY = "last_active_platform_v1"
 MAX_MESSAGE_CHARS = 4000
+MAX_IMAGE_BYTES = 4_000_000
+
+
+def _qq_image_url(value):
+    """Accept only HTTPS media from QQ controlled hosts (never arbitrary event URLs)."""
+    if not isinstance(value, str):
+        return None
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").lower()
+    allowed = any(host == suffix or host.endswith("." + suffix)
+                  for suffix in ("qpic.cn", "qq.com", "qq.com.cn", "gtimg.cn"))
+    if parsed.scheme not in ("http", "https") or not allowed or parsed.port not in (None, 80, 443) or parsed.username:
+        return None
+    return urlunsplit(("https", host, parsed.path, parsed.query, ""))
+
+
+async def _fetch_qq_image(url):
+    """Send a bounded, normalized first frame to the existing image capable model."""
+    import httpx
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    async with httpx.AsyncClient(timeout=12, follow_redirects=False, trust_env=False) as client:
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            if response.status_code != 200:
+                raise ValueError("QQ image redirect unavailable")
+            raw = bytearray()
+            async for chunk in response.aiter_bytes():
+                raw.extend(chunk)
+                if len(raw) > MAX_IMAGE_BYTES:
+                    raise ValueError("QQ image too large")
+    try:
+        with Image.open(BytesIO(raw)) as image:
+            if image.width * image.height > 20_000_000:
+                raise ValueError("QQ image dimensions too large")
+            image = ImageOps.exif_transpose(image)
+            image.thumbnail((1536, 1536))
+            target = BytesIO()
+            image.convert("RGB").save(target, format="JPEG", quality=85)
+            return base64.b64encode(target.getvalue()).decode("ascii"), "image/jpeg"
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError("QQ image format unavailable") from exc
+
+
+def _message_parts(event):
+    segments = event.get("message")
+    if not isinstance(segments, list):
+        return str(event.get("raw_message", "") or "").strip(), []
+    parts, images = [], []
+    for segment in segments:
+        if not isinstance(segment, dict) or not isinstance(segment.get("data"), dict):
+            continue
+        kind, data = segment.get("type"), segment["data"]
+        if kind == "text":
+            parts.append(str(data.get("text", "")))
+        elif kind == "face":
+            face_id = str(data.get("id", ""))
+            label = FACE_NAMES.get(face_id)
+            parts.append(f"[QQ表情：{label}]" if label else "[QQ表情]")
+        elif kind == "mface":
+            summary = str(data.get("summary") or "").strip()[:80]
+            parts.append(f"[QQ表情包：{summary}]" if summary else "[QQ表情包]")
+        elif kind == "image":
+            images.append(data)
+            parts.append("[用户发送了一张图片或表情包]")
+    return "".join(parts).strip(), images
 
 
 def _message_text(event):
-    segments = event.get("message")
-    if isinstance(segments, list):
-        return "".join(
-            str(segment.get("data", {}).get("text", ""))
-            for segment in segments if isinstance(segment, dict) and segment.get("type") == "text"
-        ).strip()
-    return str(event.get("raw_message", "") or "").strip()
+    return _message_parts(event)[0]
 
 
 def _private_message(event, self_uin):
@@ -103,6 +167,22 @@ class QQConnector:
             elif reply.get("type") == "text":
                 await self._send_text(ws, sender, reply.get("text", ""))
 
+    async def _image_content(self, ws, data):
+        url = _qq_image_url(data.get("url"))
+        if url:
+            try:
+                return await _fetch_qq_image(url)
+            except Exception:
+                if not data.get("file"):
+                    raise
+        if data.get("file"):
+            info = await self.action(ws, "get_image", {"file": data["file"]})
+            if isinstance(info, dict):
+                url = _qq_image_url(info.get("url"))
+        if not url:
+            raise ValueError("QQ image URL unavailable")
+        return await _fetch_qq_image(url)
+
     async def send_proactive(self, text, bubbles, *, as_voice=False):
         ws = self.ws
         owner = self.owner_uin()
@@ -145,14 +225,26 @@ class QQConnector:
         if text == "绑定 " + self.pair_code:
             await self._send_text(ws, sender, "已经连上了。")
             return
-        if not text or len(text) > MAX_MESSAGE_CHARS:
-            return
         message_id = event.get("message_id")
         if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
             return
+        text, images = _message_parts(event)
+        if not text or len(text) > MAX_MESSAGE_CHARS:
+            return
+        image_base64 = image_mime = None
+        if images:
+            try:
+                image_base64, image_mime = await self._image_content(ws, images[0])
+            except Exception as exc:
+                print(f"QQ image unavailable: {type(exc).__name__}", flush=True)
+                await self._send_text(ws, sender, "这张图我暂时没看清，再发一次给我好吗？")
+                return
+            if len(images) > 1:
+                text += f"（这条消息还有{len(images) - 1}张图未能查看，只针对第一张回应。）"
         try:
             response = await self._gateway(owner).process({
                 "sender_id": sender, "message_id": message_id, "text": text,
+                "image_base64": image_base64, "image_mime": image_mime,
             })
             await self._send_replies(ws, sender, response["replies"])
         except Exception as exc:

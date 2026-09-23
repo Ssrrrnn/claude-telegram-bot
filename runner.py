@@ -352,8 +352,21 @@ async def handle_text_with_memory(update, context) -> None:
 
     _active_query[chat_id] = user_text
     entry = {"role": "user", "content": user_text}
+    request_entry = entry
+    image_base64 = getattr(update.message, "image_base64", None)
+    image_mime = getattr(update.message, "image_mime", None)
+    if image_base64 and image_mime in ("image/jpeg", "image/png", "image/webp"):
+        request_entry = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:{image_mime};base64,{image_base64}",
+                }},
+            ],
+        }
     try:
-        await bot.generate_and_send(update, context, entry, entry)
+        await bot.generate_and_send(update, context, request_entry, entry)
     finally:
         _active_query.pop(chat_id, None)
 

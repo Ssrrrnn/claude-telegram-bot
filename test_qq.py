@@ -1,6 +1,6 @@
 import unittest
 
-from qq_connector import QQConnector, last_chat_platform
+from qq_connector import QQConnector, _message_parts, _qq_image_url, last_chat_platform
 from qq_gateway import QQGateway
 
 
@@ -31,6 +31,45 @@ class FakeMemory:
 
 
 class QQTests(unittest.IsolatedAsyncioTestCase):
+    def test_qq_sticker_segments_are_not_dropped(self):
+        event = {"message": [
+            {"type": "text", "data": {"text": "给你"}},
+            {"type": "face", "data": {"id": "14"}},
+            {"type": "mface", "data": {"summary": "抱抱"}},
+            {"type": "image", "data": {"file": "img-id", "url": "https://gchat.qpic.cn/a"}},
+        ]}
+        text, images = _message_parts(event)
+        self.assertEqual(text, "给你[QQ表情：微笑][QQ表情包：抱抱][用户发送了一张图片或表情包]")
+        self.assertEqual(len(images), 1)
+        self.assertIsNone(_qq_image_url("http://localhost/private"))
+        self.assertIsNone(_qq_image_url("https://gchat.qpic.cn.evil.example/a"))
+        self.assertEqual(_qq_image_url("http://gchat.qpic.cn/a"), "https://gchat.qpic.cn/a")
+
+    async def test_qq_image_reaches_multimodal_handler(self):
+        memory = FakeMemory()
+        memory.set_setting(42, "qq_owner_uin_v1", "12345678")
+        received = []
+
+        async def handler(update, context):
+            received.append((update.message.text, update.message.image_base64, update.message.image_mime))
+            await update.message.reply_text("看到了。")
+
+        connector = QQConnector(owner_chat_id=42, pair_code="secret-pairing-code-123",
+                                expected_self_uin="88888888", handler=handler, bot=object(), memory=memory)
+        connector._image_content = lambda ws, data: fake_image()
+        sent = []
+
+        async def fake_image(): return "YWJj", "image/jpeg"
+        async def send_text(ws, sender, text): sent.append(text)
+        connector._send_text = send_text
+        await connector.handle_event(None, {
+            "post_type": "message", "message_type": "private", "self_id": 88888888,
+            "user_id": 12345678, "message_id": 14,
+            "message": [{"type": "image", "data": {"url": "https://gchat.qpic.cn/a"}}],
+        })
+        self.assertEqual(received, [("[用户发送了一张图片或表情包]", "YWJj", "image/jpeg")])
+        self.assertEqual(sent, ["看到了。"])
+
     def test_first_upgrade_recovers_last_human_platform(self):
         class Memory:
             def __init__(self, message_id): self.message_id = message_id
