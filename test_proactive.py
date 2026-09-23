@@ -78,6 +78,9 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(p.stop)
         self.settings[1, self.app.KEY_NEXT_AT] = str(int(self.now.timestamp()) - 1)
         self.telegram = types.SimpleNamespace(bot=types.SimpleNamespace(send_message=AsyncMock()))
+        p = patch.object(self.app.voice_output, 'auto_spontaneous', return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
 
     async def test_daily_counter_cannot_block_and_history_persists(self):
         self.settings[1, 'proactive_day_count'] = '999'
@@ -90,6 +93,16 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(state['recent']), 1)
         await self.app._proactive_tick(self.telegram)
         self.assertEqual(self.telegram.bot.send_message.await_count, 1)
+
+    async def test_auto_proactive_can_send_voice_and_save_cooldown(self):
+        import voice_output
+
+        self.app.voice_output.auto_spontaneous.return_value = True
+        with patch.object(voice_output, 'send_voice', new_callable=AsyncMock, return_value=True) as send:
+            await self.app._proactive_tick(self.telegram)
+        send.assert_awaited_once()
+        self.telegram.bot.send_message.assert_not_awaited()
+        self.assertTrue(self.settings[(1, voice_output.AUTO_LAST_SENT_KEY)])
 
     async def test_followup_has_reason_and_is_claimed_once(self):
         state = continuity.empty()

@@ -396,9 +396,15 @@ async def _proactive_tick(application):
         if kind.startswith("回访:") and not continuity.claim_followup(runner.memory_pg, chat_id, kind.split(":", 1)[1]):
             return
         voice_mode = voice_output.mode(runner.memory_pg.get_setting, chat_id)
-        if not (voice_output.wants_audio(voice_mode, proactive=True)
-                and await voice_output.send_voice(application.bot, chat_id, text,
-                                                  get_setting=runner.memory_pg.get_setting)):
+        send_as_voice = (voice_output.wants_audio(voice_mode, proactive=True) or
+                         (voice_mode == "auto" and voice_output.auto_spontaneous(
+                             runner.memory_pg.get_setting, chat_id, reply_text=text,
+                             proactive=True, unanswered=state["silence_count"] > 0)))
+        sent_as_voice = send_as_voice and await voice_output.send_voice(
+            application.bot, chat_id, text, get_setting=runner.memory_pg.get_setting)
+        if sent_as_voice and voice_mode == "auto":
+            voice_output.record_auto_voice(runner.memory_pg.set_setting, chat_id)
+        if not sent_as_voice:
             await _send_bubbles_to_chat(application, chat_id, text)
         sent_at = int(time.time())
         replied_during_send = int(read(KEY_LAST_USER_AT) or 0) != last_user_at
