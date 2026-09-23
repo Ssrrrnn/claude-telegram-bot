@@ -13,6 +13,8 @@ class VoiceDeliveryTests(unittest.TestCase):
         self.assertFalse(voice_output.wants_audio("auto", user_text="今天怎么样"))
         self.assertTrue(voice_output.wants_audio("auto", from_voice=True))
         self.assertTrue(voice_output.wants_audio("auto", user_text="给我发条语音"))
+        self.assertTrue(voice_output.wants_audio("auto", user_text="想听你说话"))
+        self.assertTrue(voice_output.wants_audio("auto", user_text="能用声音回我吗"))
         self.assertFalse(voice_output.wants_audio("off", from_voice=True))
         self.assertTrue(voice_output.wants_audio("on", proactive=True))
         self.assertFalse(voice_output.wants_audio("auto", proactive=True))
