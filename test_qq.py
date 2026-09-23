@@ -31,6 +31,25 @@ class FakeMemory:
 
 
 class QQTests(unittest.IsolatedAsyncioTestCase):
+    async def test_proactive_sends_to_paired_qq_owner(self):
+        memory = FakeMemory()
+        memory.set_setting(42, "qq_owner_uin_v1", "12345678")
+        connector = QQConnector(
+            owner_chat_id=42, pair_code="secret-pairing-code-123",
+            expected_self_uin="88888888", handler=None,
+            bot=None, memory=memory,
+        )
+        connector.ws = object()
+        delivered = []
+
+        async def send_text(ws, sender, text):
+            delivered.append((sender, text))
+
+        connector._send_text = send_text
+        sent_as_voice = await connector.send_proactive("想你了。", ["想你了。"])
+        self.assertFalse(sent_as_voice)
+        self.assertEqual(delivered, [("12345678", "想你了。")])
+
     async def test_pairing_accepts_only_code_in_private_message_and_then_owner(self):
         memory = FakeMemory()
         received = []

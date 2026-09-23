@@ -8,6 +8,7 @@ import uuid
 from qq_gateway import QQGateway
 
 OWNER_KEY = "qq_owner_uin_v1"
+PLATFORM_KEY = "last_active_platform_v1"
 MAX_MESSAGE_CHARS = 4000
 
 
@@ -39,6 +40,7 @@ class QQConnector:
         self.pending = {}
         self.gateway = None
         self.gateway_uin = None
+        self.ws = None
 
     def owner_uin(self):
         configured = os.getenv("QQ_OWNER_UIN", "").strip()
@@ -87,6 +89,28 @@ class QQConnector:
             elif reply.get("type") == "text":
                 await self._send_text(ws, sender, reply.get("text", ""))
 
+    async def send_proactive(self, text, bubbles, *, as_voice=False):
+        ws = self.ws
+        owner = self.owner_uin()
+        if ws is None or not owner:
+            raise RuntimeError("QQ proactive destination unavailable")
+        if as_voice:
+            from qq_gateway import _Bot
+            import voice_output
+
+            outbox = []
+            if await voice_output.send_voice(
+                _Bot(outbox), self.owner_chat_id, text,
+                get_setting=self.memory.get_setting,
+            ):
+                await self._send_replies(ws, owner, outbox)
+                return True
+        for index, bubble in enumerate(bubbles):
+            if index:
+                await asyncio.sleep(0.32)
+            await self._send_text(ws, owner, bubble)
+        return False
+
     async def handle_event(self, ws, event):
         self_uin = str(event.get("self_id", ""))
         if self.expected_self_uin and self_uin != self.expected_self_uin:
@@ -129,6 +153,7 @@ class QQConnector:
                     url, additional_headers={"Authorization": "Bearer " + token},
                     max_size=2 * 1024 * 1024, ping_interval=25,
                 ) as ws:
+                    self.ws = ws
                     print("QQ OneBot private connection ready", flush=True)
                     async for raw in ws:
                         try:
@@ -149,6 +174,7 @@ class QQConnector:
             except Exception as exc:
                 print(f"QQ OneBot reconnecting: {type(exc).__name__}", flush=True)
             finally:
+                self.ws = None
                 for future in self.pending.values():
                     if not future.done():
                         future.cancel()
@@ -170,6 +196,7 @@ async def start(application, *, handler, bot, memory):
         expected_self_uin=self_uin, handler=handler, bot=bot, memory=memory,
     )
     task = asyncio.create_task(connector.run(url, token), name="qq-onebot-connector")
+    application.bot_data["qq_connector"] = connector
     application.bot_data["qq_onebot_task"] = task
 
 

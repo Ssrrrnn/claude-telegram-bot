@@ -362,6 +362,19 @@ async def handle_text_with_emotion(update, context) -> None:
 app.runner.handle_text_with_memory = handle_text_with_emotion
 app.runner.bot.handle_text = handle_text_with_emotion
 
+async def handle_text_with_platform(update, context) -> None:
+    if update.message and update.message.text and app.runner.bot.is_authorized(update.effective_chat.id):
+        platform = "qq" if getattr(update.message, "source_platform", None) == "qq" else "telegram"
+        try:
+            app.runner.memory_pg.set_setting(update.effective_chat.id, qq_connector.PLATFORM_KEY, platform)
+        except Exception as exc:
+            print(f"Active platform save skipped: {type(exc).__name__}", flush=True)
+    await handle_text_with_emotion(update, context)
+
+
+app.runner.handle_text_with_memory = handle_text_with_platform
+app.runner.bot.handle_text = handle_text_with_platform
+
 async def fixed_post_init(application) -> None:
     try:
         emotion_pg.init_db()

@@ -16,6 +16,7 @@ class _Reply:
 class _Message:
     def __init__(self, text, message_id, outbox, from_voice=False):
         self.text, self.message_id, self.from_voice = text, message_id, from_voice
+        self.source_platform = "qq"
         self.outbox = outbox
 
     async def reply_text(self, text, **kwargs):
