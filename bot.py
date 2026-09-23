@@ -285,13 +285,11 @@ def api_headers() -> dict[str, str]:
 
 
 async def ask_claude(chat_id: int, messages: list[dict[str, Any]], model: str) -> str:
-    clock_reply = realtime_clock.direct_clock_reply(messages)
-    if clock_reply is not None:
-        return clock_reply
+    clock_kind = realtime_clock.clock_question(realtime_clock.latest_user_text(messages))
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": build_system_prompt(chat_id) + "\n\n" + realtime_clock.request_clock_block()},
+            {"role": "system", "content": build_system_prompt(chat_id) + "\n\n" + realtime_clock.request_clock_block() + realtime_clock.clock_reply_instruction(clock_kind)},
             *messages,
         ],
         "stream": False,
@@ -305,13 +303,14 @@ async def ask_claude(chat_id: int, messages: list[dict[str, Any]], model: str) -
         )
     if response.status_code >= 400:
         raise RuntimeError(f"LLM API HTTP {response.status_code}: {response.text[:1800]}")
-    return extract_text(response.json())
+    answer = extract_text(response.json())
+    return realtime_clock.render_clock_reply(answer, clock_kind) if clock_kind else answer
 
 
 async def stream_claude(chat_id: int, messages: list[dict[str, Any]], model: str):
-    clock_reply = realtime_clock.direct_clock_reply(messages)
-    if clock_reply is not None:
-        yield clock_reply
+    if realtime_clock.clock_question(realtime_clock.latest_user_text(messages)):
+        # Buffer this small reply so the internal token can never reach Telegram.
+        yield await ask_claude(chat_id, messages, model)
         return
     payload = {
         "model": model,

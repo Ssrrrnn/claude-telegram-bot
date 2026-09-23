@@ -15,8 +15,61 @@ def latest_user_text(messages) -> str:
     for message in reversed(messages):
         if message.get("role") == "user":
             content = message.get("content")
+            if isinstance(content, str) and content.startswith("【生成校正，不是用户的新消息】"):
+                continue
             return content if isinstance(content, str) else ""
     return ""
+
+
+CLOCK_TOKEN = "[[LIVE_CLOCK]]"
+
+
+def clock_reply_instruction(kind: str | None) -> str:
+    if kind is None:
+        return ""
+    return (
+        "\n【本轮时间回答的表达】\n"
+        f"用户在问当前{ {'time': '钟点', 'date': '日期', 'weekday': '星期', 'period': '时段'}[kind] }。"
+        f"把唯一的时间事实写为 {CLOCK_TOKEN}，后台会在发送前填入真实时间。"
+        "围绕这个占位符，结合最近聊天和原有恋人人设，自然说一两句。"
+        "不使用‘现在是北京时间’‘按北京时间’等播报开头，不解释系统或占位符。"
+        "不另写具体钟点、日期或星期，不重复报时，不编造安排或催睡。"
+        "可以接上刚才的话题，允许轻微逗她或亲近，但不要每次强行撩、反问或加固定情话。"
+        "占位符必须完整且只出现一次。"
+    )
+
+
+def _spoken_number(value: int) -> str:
+    digits = "零一二三四五六七八九"
+    if value < 10:
+        return digits[value]
+    tens, units = divmod(value, 10)
+    return (digits[tens] if tens > 1 else "") + "十" + (digits[units] if units else "")
+
+
+def render_clock_reply(answer: str, kind: str) -> str:
+    # Sample AFTER generation so slow requests or a minute/day rollover do
+    # not leave the actual fact stale. Only the surrounding prose is generated.
+    now = now_local()
+    hour = now.hour % 12 or 12
+    minutes = "整" if not now.minute else ("零" if now.minute < 10 else "") + _spoken_number(now.minute) + "分"
+    hour_text = "两" if hour == 2 else _spoken_number(hour)
+    value = f"{part_of_day(now)}{hour_text}点{minutes}"
+    if kind == "date":
+        value = f"{now.month}月{now.day}日"
+    elif kind == "weekday":
+        value = f"星期{WEEKDAYS[now.weekday()]}"
+    elif kind == "period":
+        value = part_of_day(now)
+    rest = answer.replace(CLOCK_TOKEN, "")
+    other_fact = re.search(
+        r"[0-9零〇一二两三四五六七八九十]{1,4}(?:[:：][0-9]{1,2}|点|时|年|月|日|号)|"
+        r"(?:星期|礼拜|周)[一二三四五六日天]|北京时间|UTC|Asia/Shanghai|"
+        r"无法.{0,6}(?:时间|时钟)|不知道.{0,6}(?:几点|时间)", rest,
+    )
+    if answer.count(CLOCK_TOKEN) != 1 or other_fact or "[[" in rest or "]]" in rest:
+        return value + "。"
+    return answer.replace(CLOCK_TOKEN, value)
 
 
 def clock_question(text: str) -> str | None:
@@ -41,20 +94,6 @@ def clock_question(text: str) -> str | None:
     if re.fullmatch(r"(?:what(?:'s|is)thetime(?:now)?|whattimeisit(?:now)?)", text):
         return "time"
     return None
-
-
-def direct_clock_reply(messages) -> str | None:
-    kind = clock_question(latest_user_text(messages))
-    if kind is None:
-        return None
-    now = now_local()  # Read on every request, never at import or startup.
-    if kind == "time":
-        return f"现在是北京时间 {now:%H:%M}。"
-    if kind == "date":
-        return f"按北京时间，今天是{now.year}年{now.month}月{now.day}日，星期{WEEKDAYS[now.weekday()]}。"
-    if kind == "weekday":
-        return f"按北京时间，今天星期{WEEKDAYS[now.weekday()]}，{now.month}月{now.day}日。"
-    return f"现在是北京时间 {now:%H:%M}，{part_of_day(now)}。"
 
 
 def part_of_day(now: datetime) -> str:
