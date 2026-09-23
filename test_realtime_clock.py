@@ -59,6 +59,45 @@ class ClockTransportTests(unittest.IsolatedAsyncioTestCase):
             spec.loader.exec_module(self.bot)
         self.bot.build_system_prompt = lambda chat: "persona plus stale historical time 02:00"
 
+    async def test_voice_request_generates_spoken_reply_and_retries_empty_promise(self):
+        from types import SimpleNamespace
+        import voice_output
+
+        self.bot.stream_preferences[7] = False
+        self.bot.current_model = lambda chat: "mock"
+        self.bot.get_setting = lambda chat, key: None
+        self.bot.ask_claude = AsyncMock(side_effect=["等一下，我给你发语音。", "你回来了。今天想听我说什么？"])
+        self.bot.safe_reply = AsyncMock()
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=7),
+            message=SimpleNamespace(message_id=3, from_voice=False),
+        )
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        entry = {"role": "user", "content": "给我发条语音，陪我聊聊"}
+        with patch.object(voice_output, "send_voice", new_callable=AsyncMock, return_value=True) as send:
+            await self.bot.generate_and_send(update, context, entry, entry)
+        self.assertEqual(self.bot.ask_claude.await_count, 2)
+        self.assertIn("直接合成语音", self.bot.ask_claude.call_args_list[0].args[1][-1]["content"])
+        self.assertEqual(send.await_args.args[2], "你回来了。今天想听我说什么？")
+        self.assertEqual(self.bot.histories[7][-2:], [entry, {"role": "assistant", "content": "你回来了。今天想听我说什么？"}])
+        self.bot.safe_reply.assert_not_awaited()
+
+    async def test_voice_failure_sends_actual_reply_as_text(self):
+        from types import SimpleNamespace
+        import voice_output
+
+        self.bot.stream_preferences[8] = False
+        self.bot.current_model = lambda chat: "mock"
+        self.bot.get_setting = lambda chat, key: None
+        self.bot.ask_claude = AsyncMock(return_value="在呢。靠过来，我陪你。")
+        self.bot.safe_reply = AsyncMock()
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=8), message=SimpleNamespace(message_id=4))
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        entry = {"role": "user", "content": "发语音给我"}
+        with patch.object(voice_output, "send_voice", new_callable=AsyncMock, return_value=False):
+            await self.bot.generate_and_send(update, context, entry, entry)
+        self.bot.safe_reply.assert_awaited_once_with(update, "在呢。靠过来，我陪你。")
+
     async def test_clock_preserves_context_and_voice_in_both_modes(self):
         messages = [{"role": "user", "content": "你知道现在几点了吗"}]
         response = MagicMock(status_code=200)

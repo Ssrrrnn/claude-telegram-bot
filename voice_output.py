@@ -80,7 +80,12 @@ def wants_audio(current_mode, *, from_voice=False, user_text="", proactive=False
         return True
     if proactive:
         return False
-    return from_voice or bool(re.search(r"(?:发|来|回|说).{0,4}语音|语音(?:回|说|回复)", user_text))
+    return from_voice or bool(re.search(
+        r"(?:发|来|回|说|录|听).{0,8}(?:条|段|个)?(?:语音|声音)"
+        r"|(?:语音|声音)(?:.{0,6})(?:回|说|回复|发|录|听)"
+        r"|(?:想听|要听)(?:你|一下你)?.{0,6}(?:说话|声音)",
+        user_text,
+    ))
 
 
 def clean_speech(text):
@@ -206,7 +211,10 @@ async def send_voice(bot, chat_id, text, *, reply_to_message_id=None,
         return True
     except Exception as exc:
         # The caller falls back to a normal text reply with the same words.
-        print(f"Voice delivery skipped: {type(exc).__name__}", flush=True)
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        print(f"Voice delivery skipped: provider={locals().get('selected_backend', 'unknown')}, "
+              f"error={type(exc).__name__}, status={status}", flush=True)
         return False
 
 

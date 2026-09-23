@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import sqlite3
 import time
 from collections import defaultdict
@@ -390,6 +391,27 @@ async def transcribe_audio(raw: bytes, filename: str, mime_type: str) -> str:
     return str(text).strip()
 
 
+VOICE_REPLY_INSTRUCTION = (
+    "【本轮回复方式】程序会把你这一条回复直接合成语音并发送。"
+    "请直接说你现在想对用户说的话，像正在通话一样自然地接住上下文。"
+    "不要说‘等一下’‘稍等’‘马上给你发’‘我录一下’，不要解释如何发送语音、请求用户等待或许诺下一条消息。"
+    "这一条文字本身就是语音的内容。"
+)
+
+
+def voice_deferral(text: str) -> bool:
+    """Catch short promises to send audio instead of an actual reply."""
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) > 95:
+        return False
+    return bool(re.search(
+        r"(?:等一下|稍等|等我|等会|待会|一会儿|马上|这就|稍后|先等|我去|我来).{0,24}"
+        r"(?:发|录|做|生成|合成|弄|准备|回|说).{0,8}(?:语音|声音|音频)"
+        r"|(?:语音|声音|音频).{0,14}(?:发给你|给你发|马上发|等一下|稍等)",
+        compact,
+    ))
+
+
 async def generate_and_send(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -400,14 +422,27 @@ async def generate_and_send(
         return
     chat_id = update.effective_chat.id
     async with chat_locks[chat_id]:
+        import voice_output
+        user_text = history_user_entry.get("content", "")
+        voice_mode = voice_output.mode(get_setting, chat_id)
+        use_voice = voice_output.wants_audio(
+            voice_mode,
+            from_voice=getattr(update.message, "from_voice", False),
+            user_text=user_text if isinstance(user_text, str) else "",
+        )
         request_messages = [*histories[chat_id], request_user_entry]
+        if use_voice and isinstance(request_user_entry.get("content"), str):
+            request_messages[-1] = {
+                **request_user_entry,
+                "content": request_user_entry["content"] + "\n\n" + VOICE_REPLY_INSTRUCTION,
+            }
         model = current_model(chat_id)
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
         answer = ""
         placeholder = None
         try:
-            if stream_preferences[chat_id]:
+            if stream_preferences[chat_id] and not use_voice:
                 placeholder = await update.message.reply_text("…")
                 last_edit = 0.0
                 async for delta in stream_claude(chat_id, request_messages, model):
@@ -423,7 +458,7 @@ async def generate_and_send(
             else:
                 answer = await ask_claude(chat_id, request_messages, model)
         except Exception as stream_exc:
-            if stream_preferences[chat_id] and not answer:
+            if stream_preferences[chat_id] and not use_voice and not answer:
                 try:
                     answer = await ask_claude(chat_id, request_messages, model)
                 except Exception as fallback_exc:
@@ -438,9 +473,21 @@ async def generate_and_send(
                 await safe_reply(update, f"API 请求失败：\n{str(stream_exc)[:1800]}")
                 return
 
-        histories[chat_id].append(history_user_entry)
-        histories[chat_id].append({"role": "assistant", "content": answer})
-        histories[chat_id] = histories[chat_id][-MAX_HISTORY_MESSAGES:]
+        if use_voice and voice_deferral(answer):
+            try:
+                retry_messages = [
+                    *request_messages[:-1],
+                    {**request_messages[-1], "content": request_messages[-1]["content"] + (
+                        "\n\n【生成校正】上一版只答应稍后发语音，没有真正回应。"
+                        "本条消息将直接作为语音发送。现在就说出完整、具体的回复；不要提发送流程或等待。"
+                    )},
+                ]
+                answer = await ask_claude(chat_id, retry_messages, model)
+            except Exception as exc:
+                print(f"Voice reply retry failed: {type(exc).__name__}", flush=True)
+            if voice_deferral(answer):
+                # Never send an empty promise as a voice message.
+                answer = "我在。刚才那句没说好，想听你说说现在的事。"
 
         chunks = split_text(answer)
         if placeholder:
@@ -451,20 +498,18 @@ async def generate_and_send(
                 except Exception:
                     await update.message.reply_text(chunk)
         else:
-            import voice_output
-            user_text = history_user_entry.get("content", "")
-            voice_mode = voice_output.mode(get_setting, chat_id)
-            use_voice = voice_output.wants_audio(
-                voice_mode,
-                from_voice=getattr(update.message, "from_voice", False),
-                user_text=user_text if isinstance(user_text, str) else "",
-            )
-            if not (use_voice and await voice_output.send_voice(
+            sent_as_voice = use_voice and await voice_output.send_voice(
                 context.bot, chat_id, answer,
                 reply_to_message_id=update.message.message_id,
                 get_setting=get_setting,
-            )):
+            )
+            if not sent_as_voice:
                 await safe_reply(update, answer)
+            print(f"Reply delivered: chat_id={chat_id}, channel={'voice' if sent_as_voice else 'text'}", flush=True)
+
+        histories[chat_id].append(history_user_entry)
+        histories[chat_id].append({"role": "assistant", "content": answer})
+        histories[chat_id] = histories[chat_id][-MAX_HISTORY_MESSAGES:]
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
