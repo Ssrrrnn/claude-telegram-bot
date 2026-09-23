@@ -66,6 +66,7 @@ class ClockTransportTests(unittest.IsolatedAsyncioTestCase):
         self.bot.stream_preferences[7] = False
         self.bot.current_model = lambda chat: "mock"
         self.bot.get_setting = lambda chat, key: None
+        self.bot.set_setting = MagicMock()
         self.bot.ask_claude = AsyncMock(side_effect=["等一下，我给你发语音。", "你回来了。今天想听我说什么？"])
         self.bot.safe_reply = AsyncMock()
         update = SimpleNamespace(
@@ -97,6 +98,28 @@ class ClockTransportTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(voice_output, "send_voice", new_callable=AsyncMock, return_value=False):
             await self.bot.generate_and_send(update, context, entry, entry)
         self.bot.safe_reply.assert_awaited_once_with(update, "在呢。靠过来，我陪你。")
+
+    async def test_auto_can_choose_voice_after_an_ordinary_reply(self):
+        from types import SimpleNamespace
+        import voice_output
+
+        self.bot.stream_preferences[9] = False
+        self.bot.current_model = lambda chat: "mock"
+        self.bot.get_setting = lambda chat, key: None
+        self.bot.set_setting = MagicMock()
+        self.bot.ask_claude = AsyncMock(return_value="过来，我抱你一会儿。")
+        self.bot.safe_reply = AsyncMock()
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=9), message=SimpleNamespace(message_id=5))
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        entry = {"role": "user", "content": "今天好累"}
+        with patch.object(voice_output, "auto_spontaneous", return_value=True) as choose, \
+             patch.object(voice_output, "send_voice", new_callable=AsyncMock, return_value=True), \
+             patch.object(voice_output, "record_auto_voice") as record:
+            await self.bot.generate_and_send(update, context, entry, entry)
+        self.assertEqual(self.bot.ask_claude.await_args.args[1][-1], entry)
+        self.assertEqual(choose.call_args.kwargs["reply_text"], "过来，我抱你一会儿。")
+        record.assert_called_once_with(self.bot.set_setting, 9)
+        self.bot.safe_reply.assert_not_awaited()
 
     async def test_clock_preserves_context_and_voice_in_both_modes(self):
         messages = [{"role": "user", "content": "你知道现在几点了吗"}]
