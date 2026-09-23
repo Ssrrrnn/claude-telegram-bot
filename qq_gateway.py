@@ -14,9 +14,11 @@ class _Reply:
 
 
 class _Message:
-    def __init__(self, text, message_id, outbox, from_voice=False, image_base64=None, image_mime=None):
+    def __init__(self, text, message_id, outbox, from_voice=False, image_base64=None, image_mime=None,
+                 qq_sticker_status=None):
         self.text, self.message_id, self.from_voice = text, message_id, from_voice
         self.image_base64, self.image_mime = image_base64, image_mime
+        self.qq_sticker_status = qq_sticker_status
         self.source_platform = "qq"
         self.outbox = outbox
 
@@ -101,7 +103,8 @@ class QQGateway:
             update = SimpleNamespace(
                 effective_chat=SimpleNamespace(id=self.shared_chat_id),
                 message=_Message(text.strip(), -message_id, outbox, from_voice=bool(audio),
-                                 image_base64=image, image_mime=image_mime),
+                                 image_base64=image, image_mime=image_mime,
+                                 qq_sticker_status=data.get("qq_sticker_status")),
             )
             context = SimpleNamespace(bot=_Bot(outbox))
             await self.handler(update, context)
