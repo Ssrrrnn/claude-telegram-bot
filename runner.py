@@ -352,14 +352,19 @@ async def handle_text_with_memory(update, context) -> None:
 
     _active_query[chat_id] = user_text
     entry = {"role": "user", "content": user_text}
-    request_entry = entry
+    request_text = user_text
+    if getattr(update.message, "qq_sticker_status", None) == "available":
+        request_text += "\n\n[QQ平台状态：本轮回复后会立即发出一张已收藏表情包。自然回应当下的话，不要说稍后发或解释发送流程。]"
+    elif getattr(update.message, "qq_sticker_status", None) == "empty":
+        request_text += "\n\n[QQ平台状态：目前没有已收藏的表情包。诚实、简短地请用户先在QQ发几张商城表情；不要答应马上发送。]"
+    request_entry = entry if request_text == user_text else {"role": "user", "content": request_text}
     image_base64 = getattr(update.message, "image_base64", None)
     image_mime = getattr(update.message, "image_mime", None)
     if image_base64 and image_mime in ("image/jpeg", "image/png", "image/webp"):
         request_entry = {
             "role": "user",
             "content": [
-                {"type": "text", "text": user_text},
+                {"type": "text", "text": request_text},
                 {"type": "image_url", "image_url": {
                     "url": f"data:{image_mime};base64,{image_base64}",
                 }},
