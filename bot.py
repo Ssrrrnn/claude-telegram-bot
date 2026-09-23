@@ -498,11 +498,19 @@ async def generate_and_send(
                 except Exception:
                     await update.message.reply_text(chunk)
         else:
-            sent_as_voice = use_voice and await voice_output.send_voice(
+            spontaneous = (voice_mode == "auto" and not use_voice and
+                           voice_output.auto_spontaneous(
+                               get_setting, chat_id,
+                               user_text=user_text if isinstance(user_text, str) else "",
+                               reply_text=answer,
+                           ))
+            sent_as_voice = (use_voice or spontaneous) and await voice_output.send_voice(
                 context.bot, chat_id, answer,
                 reply_to_message_id=update.message.message_id,
                 get_setting=get_setting,
             )
+            if sent_as_voice and voice_mode == "auto":
+                voice_output.record_auto_voice(set_setting, chat_id)
             if not sent_as_voice:
                 await safe_reply(update, answer)
             print(f"Reply delivered: chat_id={chat_id}, channel={'voice' if sent_as_voice else 'text'}", flush=True)
