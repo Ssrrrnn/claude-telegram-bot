@@ -1,4 +1,4 @@
-"""Optional Telegram voice replies using CosyVoice or Edge TTS."""
+"""Optional Telegram voice replies using Fish Audio, CosyVoice, or Edge TTS."""
 import asyncio
 import io
 import os
@@ -8,10 +8,13 @@ MODE_KEY = "voice_reply_mode_v1"
 PROFILE_KEY = "voice_profile_v1"
 BACKEND_KEY = "voice_backend_v1"
 CUSTOM_VOICE_KEY = "voice_custom_uri_v1"
+FISH_VOICE_KEY = "voice_fish_id_v1"
 DEFAULT_MODE = "auto"
 COSYVOICE_API_KEY = os.getenv("COSYVOICE_API_KEY", "").strip()
 COSYVOICE_API_URL = "https://api.siliconflow.cn/v1/audio/speech"
 COSYVOICE_MODEL = "FunAudioLLM/CosyVoice2-0.5B"
+FISH_API_KEY = os.getenv("FISH_API_KEY", "").strip()
+FISH_MODEL = os.getenv("FISH_TTS_MODEL", "s2.1-pro-free").strip()
 # Keep the original timbre. Shifting pitch down by 12 Hz made the former
 # Yunxi default sound processed, particularly on short chat messages.
 PROFILES = {
@@ -36,13 +39,17 @@ def mode(get_setting, chat_id):
 
 def profile(get_setting, chat_id):
     value = get_setting(chat_id, PROFILE_KEY)
-    if value == "custom" and get_setting(chat_id, CUSTOM_VOICE_KEY):
+    if backend(get_setting, chat_id) == "fish" and get_setting(chat_id, FISH_VOICE_KEY):
+        return "custom"
+    if value == "custom" and backend(get_setting, chat_id) == "cosyvoice" and get_setting(chat_id, CUSTOM_VOICE_KEY):
         return "custom"
     return value if value in PROFILES else DEFAULT_PROFILE
 
 
 def backend(get_setting, chat_id):
     selected = get_setting(chat_id, BACKEND_KEY)
+    if selected == "fish" and FISH_API_KEY:
+        return "fish"
     if selected == "edge":
         return "edge"
     if COSYVOICE_API_KEY and selected in (None, "cosyvoice"):
@@ -100,7 +107,27 @@ async def synthesize_cosyvoice(text, voice_profile=DEFAULT_PROFILE, custom_voice
         return audio
 
 
+async def synthesize_fish(text, voice_id):
+    import httpx
+
+    if not FISH_API_KEY or not voice_id:
+        raise ValueError("Fish Audio key or voice ID is missing")
+    async with httpx.AsyncClient(timeout=75) as client:
+        response = await client.post(
+            "https://api.fish.audio/v1/tts",
+            headers={"Authorization": f"Bearer {FISH_API_KEY}", "model": FISH_MODEL},
+            json={"text": text, "reference_id": voice_id, "format": "mp3"},
+        )
+        response.raise_for_status()
+        audio = response.content
+        if not audio or len(audio) > MAX_AUDIO_BYTES or "audio" not in response.headers.get("content-type", ""):
+            raise ValueError("Invalid Fish Audio response")
+        return audio
+
+
 async def synthesize(text, voice_profile=DEFAULT_PROFILE, provider="edge", custom_voice=""):
+    if provider == "fish":
+        return await synthesize_fish(text, custom_voice)
     if provider == "cosyvoice":
         return await synthesize_cosyvoice(text, voice_profile, custom_voice)
     # Import at use time so a TTS outage cannot prevent startup or text chat.
@@ -133,7 +160,8 @@ async def send_voice(bot, chat_id, text, *, reply_to_message_id=None,
         from telegram import InputFile
         selected = voice_profile or (profile(get_setting, chat_id) if get_setting else DEFAULT_PROFILE)
         selected_backend = provider or (backend(get_setting, chat_id) if get_setting else "edge")
-        custom_voice = get_setting(chat_id, CUSTOM_VOICE_KEY) if get_setting else ""
+        voice_key = FISH_VOICE_KEY if selected_backend == "fish" else CUSTOM_VOICE_KEY
+        custom_voice = get_setting(chat_id, voice_key) if get_setting else ""
         audio = await synthesize(speech, selected, selected_backend, custom_voice or "")
         await bot.send_voice(
             chat_id=chat_id,
@@ -169,6 +197,30 @@ async def upload_custom_voice(raw, filename, mime, name, reference_text):
         return voice_id
 
 
+async def upload_fish_voice(raw, filename, mime, name):
+    import httpx
+
+    if not FISH_API_KEY:
+        raise ValueError("Fish Audio API key is missing")
+    if not raw or len(raw) > 5_000_000:
+        raise ValueError("Invalid reference audio size")
+    async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.post(
+            "https://api.fish.audio/model",
+            headers={"Authorization": f"Bearer {FISH_API_KEY}"},
+            data={"type": "tts", "title": name, "visibility": "private", "train_mode": "fast"},
+            files={"voices": (filename, raw, mime)},
+        )
+        response.raise_for_status()
+        result = response.json()
+        voice_id = result.get("_id") or result.get("id")
+        if not isinstance(voice_id, str) or not voice_id or len(voice_id) > 200:
+            raise ValueError("Fish Audio voice ID was not returned")
+        if result.get("state") == "failed":
+            raise ValueError("Fish Audio voice training failed")
+        return voice_id
+
+
 async def voice_command(update, context, *, get_setting, set_setting):
     if not update.message:
         return
@@ -179,6 +231,42 @@ async def voice_command(update, context, *, get_setting, set_setting):
         return
     args = getattr(context, "args", [])
     option = args[0].lower() if args else ""
+    if option == "clone" and len(args) > 1 and args[1].lower() == "fish":
+        if not FISH_API_KEY:
+            await update.message.reply_text("先在 Railway 配置 FISH_API_KEY，再创建 Fish Audio 音色。")
+            return
+        sample_message = update.message.reply_to_message
+        sample = (getattr(sample_message, "audio", None) or
+                  getattr(sample_message, "voice", None) or
+                  getattr(sample_message, "document", None)) if sample_message else None
+        name = args[2] if len(args) > 2 else "myvoice"
+        if not sample or not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_-]{1,31}", name):
+            await update.message.reply_text(
+                "先发送一段你有权使用的清晰单人录音，然后回复那条录音："
+                "\n/voice clone fish myvoice"
+                "\n名称用 2–32 位英文字母、数字或下划线。无需逐字稿。"
+            )
+            return
+        mime = getattr(sample, "mime_type", "") or "audio/ogg"
+        ext = {"audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/wav": "wav",
+               "audio/x-wav": "wav", "audio/ogg": "opus", "audio/opus": "opus",
+               "audio/mp4": "m4a", "audio/x-m4a": "m4a"}.get(mime)
+        if not ext or (getattr(sample, "file_size", 0) or 0) > 5_000_000:
+            await update.message.reply_text("请发送小于 5 MB 的 MP3、WAV、M4A 或 Opus 录音。")
+            return
+        try:
+            tg_file = await sample.get_file()
+            raw = bytes(await tg_file.download_as_bytearray())
+            voice_id = await upload_fish_voice(raw, f"sample.{ext}", mime, name)
+        except Exception as exc:
+            print(f"Fish Audio clone skipped: {type(exc).__name__}", flush=True)
+            await update.message.reply_text("Fish Audio 音色创建失败。请检查密钥、录音和账户额度，稍后重试。")
+            return
+        set_setting(chat_id, FISH_VOICE_KEY, voice_id)
+        set_setting(chat_id, BACKEND_KEY, "fish")
+        set_setting(chat_id, PROFILE_KEY, "custom")
+        await update.message.reply_text("Fish Audio 私有音色已保存并选中。发 /voice sample 试听。")
+        return
     if option == "clone":
         if not COSYVOICE_API_KEY:
             await update.message.reply_text("先在 Railway 配置 COSYVOICE_API_KEY，才能创建专属音色。")
@@ -220,20 +308,31 @@ async def voice_command(update, context, *, get_setting, set_setting):
         return
     if option == "provider":
         selected = args[1].lower() if len(args) > 1 else ""
+        if selected == "fish" and not FISH_API_KEY:
+            await update.message.reply_text("Fish Audio 还没有配置接口密钥。需要先在 Railway 设置 FISH_API_KEY。")
+            return
+        if selected == "fish" and not get_setting(chat_id, FISH_VOICE_KEY):
+            await update.message.reply_text("先用 /voice clone fish myvoice 创建专属音色。")
+            return
         if selected == "cosyvoice" and not COSYVOICE_API_KEY:
             await update.message.reply_text("CosyVoice 还没有配置接口密钥。需要先在 Railway 设置 COSYVOICE_API_KEY。")
             return
-        if selected in ("edge", "cosyvoice"):
+        if selected in ("edge", "cosyvoice", "fish"):
             set_setting(chat_id, BACKEND_KEY, selected)
         active = backend(get_setting, chat_id)
+        label = {"fish": "Fish Audio", "cosyvoice": "CosyVoice", "edge": "Edge TTS"}[active]
         await update.message.reply_text(
-            f"当前语音服务：{'CosyVoice' if active == 'cosyvoice' else 'Edge TTS'}。"
-            "\n用 /voice provider cosyvoice 或 /voice provider edge 切换。"
+            f"当前语音服务：{label}。"
+            "\n用 /voice provider fish、/voice provider cosyvoice 或 /voice provider edge 切换。"
         )
         return
     if option == "tone":
         chosen = args[1].lower() if len(args) > 1 else ""
-        if chosen == "custom" and not get_setting(chat_id, CUSTOM_VOICE_KEY):
+        if backend(get_setting, chat_id) == "fish" and chosen in PROFILES:
+            await update.message.reply_text("Fish Audio 使用克隆音色 custom；natural、deep、soft 属于其他语音服务。")
+            return
+        voice_key = FISH_VOICE_KEY if backend(get_setting, chat_id) == "fish" else CUSTOM_VOICE_KEY
+        if chosen == "custom" and not get_setting(chat_id, voice_key):
             await update.message.reply_text("还没有专属音色。先用 /voice clone 创建。")
         elif chosen in PROFILES or chosen == "custom":
             set_setting(chat_id, PROFILE_KEY, chosen)
@@ -249,7 +348,11 @@ async def voice_command(update, context, *, get_setting, set_setting):
         return
     if option == "sample":
         chosen = args[1].lower() if len(args) > 1 else profile(get_setting, chat_id)
-        if chosen not in PROFILES and not (chosen == "custom" and get_setting(chat_id, CUSTOM_VOICE_KEY)):
+        if backend(get_setting, chat_id) == "fish" and chosen in PROFILES:
+            await update.message.reply_text("Fish Audio 使用克隆音色 custom。发 /voice sample 试听。")
+            return
+        voice_key = FISH_VOICE_KEY if backend(get_setting, chat_id) == "fish" else CUSTOM_VOICE_KEY
+        if chosen not in PROFILES and not (chosen == "custom" and get_setting(chat_id, voice_key)):
             await update.message.reply_text("音色可选：natural、deep、soft；创建专属音色后可选 custom。")
             return
         sample = "刚刚听见你的声音了。别急，我在这儿，慢慢跟我说。"
@@ -268,5 +371,5 @@ async def voice_command(update, context, *, get_setting, set_setting):
          "auto": "语音已设为自动：你发语音或明确要语音时，我回语音；其他时候回文字。",
          "on": "语音回复已开启：适合的短回复会发语音；长回复或合成失败时回文字。"}[current]
         + "\n用 /voice on、/voice auto、/voice off 切换。"
-        + "\n/voice tone 查看音色，/voice sample 试听，/voice clone 创建音色。"
+        + "\n/voice tone 查看音色，/voice sample 试听，/voice clone fish myvoice 创建 Fish Audio 音色。"
     )
