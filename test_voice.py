@@ -2,7 +2,9 @@ import asyncio
 import sys
 import types
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import voice_output
 
@@ -18,6 +20,28 @@ class VoiceDeliveryTests(unittest.TestCase):
         self.assertFalse(voice_output.wants_audio("off", from_voice=True))
         self.assertTrue(voice_output.wants_audio("on", proactive=True))
         self.assertFalse(voice_output.wants_audio("auto", proactive=True))
+        self.assertFalse(voice_output.wants_audio("auto", user_text="别给我发语音"))
+
+    def test_auto_speaks_sometimes_without_an_explicit_request(self):
+        now = datetime(2026, 9, 23, 18, tzinfo=ZoneInfo("Asia/Shanghai"))
+        values = {}
+        get = lambda chat, key: values.get((chat, key))
+        set_value = lambda chat, key, value: values.__setitem__((chat, key), value)
+        selection = dict(user_text="今天好累", reply_text="过来，我抱你一会儿。", now=now)
+        self.assertTrue(voice_output.auto_spontaneous(get, 7, chance=0.2, **selection))
+        self.assertFalse(voice_output.auto_spontaneous(get, 7, chance=0.6, **selection))
+        voice_output.record_auto_voice(set_value, 7, sent_at=now.timestamp())
+        self.assertFalse(voice_output.auto_spontaneous(get, 7, chance=0, **selection))
+        self.assertTrue(voice_output.auto_spontaneous(get, 7, chance=0, **{**selection, "now": now + timedelta(minutes=41)}))
+
+    def test_auto_does_not_ambush_sleep_or_unanswered_messages(self):
+        get = lambda chat, key: None
+        now = datetime(2026, 9, 23, 2, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.assertFalse(voice_output.auto_spontaneous(get, 7, user_text="好累", reply_text="我陪你。", now=now, chance=0))
+        now = now.replace(hour=20)
+        self.assertFalse(voice_output.auto_spontaneous(get, 7, user_text="只要文字", reply_text="我陪你。", now=now, chance=0))
+        self.assertFalse(voice_output.auto_spontaneous(get, 7, reply_text="我陪你。", proactive=True, unanswered=True, now=now, chance=0))
+        self.assertFalse(voice_output.auto_spontaneous(get, 7, user_text="现在几点", reply_text="晚上八点。", now=now, chance=0))
 
     def test_voice_failure_returns_false_for_text_fallback(self):
         class BrokenBot:
