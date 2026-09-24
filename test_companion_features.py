@@ -102,6 +102,27 @@ class QQNativeTests(unittest.IsolatedAsyncioTestCase):
             await self.connector._alert_if_still_offline()
         tg.send_message.assert_awaited_once()
 
+    async def test_account_logout_is_detected_even_with_websocket_open(self):
+        tg = SimpleNamespace(send_message=AsyncMock())
+        self.connector.telegram_bot = tg
+        self.connector.ever_connected = True
+        ws = self.connector.ws = object()
+        async def login(ws, name, params):
+            return {'online': False} if name == 'get_status' else {'user_id': 88888888}
+        self.connector.action = login
+        with patch('qq_connector.OFFLINE_ALERT_DELAY_SECONDS', 0):
+            self.assertFalse(await self.connector._check_login(ws))
+            self.assertIs(self.connector.ws, ws)
+            self.assertFalse(await self.connector._check_login(ws))
+            self.assertIsNone(self.connector.ws)
+            await self.connector.offline_alert_task
+        self.assertIn('重新扫码', tg.send_message.call_args.kwargs['text'])
+        async def restored(ws, name, params):
+            return {'online': True} if name == 'get_status' else {'user_id': 88888888}
+        self.connector.action = restored
+        self.assertTrue(await self.connector._check_login(ws))
+        self.assertIs(self.connector.ws, ws)
+
 
 if __name__ == '__main__':
     unittest.main()
