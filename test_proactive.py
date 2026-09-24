@@ -104,14 +104,12 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.app._load_state(1)['silence_count'], 1)
 
     async def test_auto_proactive_can_send_voice_and_save_cooldown(self):
-        import voice_output
-
         self.app.voice_output.auto_spontaneous.return_value = True
-        with patch.object(voice_output, 'send_voice', new_callable=AsyncMock, return_value=True) as send:
+        with patch.object(self.app.voice_output, 'send_voice', new_callable=AsyncMock, return_value=True) as send:
             await self.app._proactive_tick(self.telegram)
         send.assert_awaited_once()
         self.telegram.bot.send_message.assert_not_awaited()
-        self.assertTrue(self.settings[(1, voice_output.AUTO_LAST_SENT_KEY)])
+        self.assertTrue(self.settings[(1, self.app.voice_output.AUTO_LAST_SENT_KEY)])
 
     async def test_followup_has_reason_and_is_claimed_once(self):
         state = continuity.empty()
@@ -134,6 +132,26 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.app._proactive_tick(self.telegram)
         self.telegram.bot.send_message.assert_not_called()
         self.assertGreater(int(self.settings[1, self.app.KEY_NEXT_AT]), self.now.timestamp())
+
+    async def test_first_morning_contact_sends_even_if_model_declines(self):
+        self.app.runner.bot.ask_claude.return_value = 'NO_REPLY'
+        with patch.object(self.app, '_now_local', return_value=self.now.replace(hour=8, minute=50)):
+            await self.app._proactive_tick(self.telegram)
+            self.assertFalse(self.app._first_morning_contact(1))
+        self.telegram.bot.send_message.assert_awaited()
+        text = self.telegram.bot.send_message.call_args.kwargs['text']
+        self.assertNotEqual(text, 'NO_REPLY')
+        self.assertTrue(any(word in text for word in ('早', '醒了')))
+
+    async def test_morning_message_does_not_repeat_yesterday(self):
+        yesterday = '早。醒了再回我，想听你说说话。'
+        state = self.app._load_state(1)
+        state['recent'] = [{'type': '想念', 'content': yesterday}]
+        self.app._save_state(1, state)
+        self.app.runner.bot.ask_claude.return_value = 'NO_REPLY'
+        with patch.object(self.app, '_now_local', return_value=self.now.replace(hour=8, minute=50)):
+            await self.app._proactive_tick(self.telegram)
+        self.assertNotEqual(self.telegram.bot.send_message.call_args.kwargs['text'], yesterday)
 
     async def test_declined_due_followup_does_not_retry_every_tick(self):
         state = continuity.empty()
