@@ -554,6 +554,7 @@ class QQConnector:
                 ) as ws:
                     self.ws = ws
                     self.last_status = None
+                    self.last_status_at = 0
                     print("QQ OneBot private connection ready", flush=True)
                     status_task = asyncio.create_task(self._status_loop(ws), name="qq-display-status")
                     try:
