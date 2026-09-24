@@ -99,6 +99,15 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
         await self.connector.handle_event(None, self.event('你试一下喽宝宝'))
         self.assertFalse(any(name == 'send_qzone_msg' for name, _ in self.calls))
 
+    async def test_missed_owner_request_is_published_once_and_acknowledged(self):
+        ws = self.connector.ws = object()
+        with patch('qq_qzone.generate_requested_post', new_callable=AsyncMock,
+                   return_value='想你了。'):
+            await self.connector._recover_missed_qzone_request_once(ws)
+            await self.connector._recover_missed_qzone_request_once(ws)
+        self.assertEqual(len([name for name, _ in self.calls if name == 'send_qzone_msg']), 1)
+        self.assertIn('这次已经发到空间了', self.calls[-1][1]['message'])
+
     async def test_short_followups_use_recent_qzone_topic_and_real_status(self):
         self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
         with patch('qq_qzone.generate_requested_post', new_callable=AsyncMock,
