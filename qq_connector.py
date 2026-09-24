@@ -27,6 +27,7 @@ CUSTOM_FACE_REFRESH_SECONDS = 24 * 60 * 60
 REACTION_COOLDOWN_SECONDS = 4 * 60 * 60
 POKE_COOLDOWN_SECONDS = 12 * 60 * 60
 OFFLINE_ALERT_DELAY_SECONDS = 120
+QZONE_DIAGNOSTIC_KEY = 'qq_qzone_diagnostic_20260924_v1'
 
 
 def _qq_image_url(value):
@@ -232,11 +233,26 @@ class QQConnector:
             try:
                 healthy = await self._check_login(ws)
                 if healthy:
+                    await self._probe_qzone_once(ws)
                     await self._refresh_status(ws)
             except Exception as exc:
                 print(f"QQ display status check skipped: {type(exc).__name__}", flush=True)
                 healthy = False
             await asyncio.sleep(5 * 60 if healthy else 60)
+
+    async def _probe_qzone_once(self, ws):
+        """One authorized live publish test; record intent before the remote call to avoid duplicates."""
+        if ws is not self.ws or not self.owner_uin():
+            return
+        try:
+            if self.memory.get_setting(self.owner_chat_id, QZONE_DIAGNOSTIC_KEY):
+                return
+            self.memory.set_setting(self.owner_chat_id, QZONE_DIAGNOSTIC_KEY, 'attempted')
+            async with self.qzone_auto_lock:
+                tid = await self._post_qzone(ws, '测试一下', visibility=4)
+            print(f'QQ Qzone diagnostic published: tid={tid}', flush=True)
+        except Exception as exc:
+            print(f'QQ Qzone diagnostic failed: {type(exc).__name__}: {str(exc)[:250]}', flush=True)
 
     async def _check_login(self, ws):
         try:
