@@ -13,6 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 from qq_gateway import QQGateway
 from qq_face_names import FACE_NAMES
 import qq_stickers
+import qq_status
 
 OWNER_KEY = "qq_owner_uin_v1"
 PLATFORM_KEY = "last_active_platform_v1"
@@ -137,6 +138,11 @@ class QQConnector:
         self.custom_faces_fetched_at = 0
         self.last_reaction_at = 0
         self.last_poke_at = 0
+        self.status_lock = asyncio.Lock()
+        self.last_status = None
+        self.last_status_at = 0
+        self.last_user_at = 0
+        self.love_until = 0
 
     def owner_uin(self):
         configured = os.getenv("QQ_OWNER_UIN", "").strip()
@@ -168,6 +174,38 @@ class QQConnector:
         if not isinstance(text, str) or not text:
             return
         await self.action(ws, "send_private_msg", {"user_id": int(sender), "message": text})
+
+    async def _refresh_status(self, ws, *, urgent=False):
+        if os.getenv("QQ_AUTO_STATUS", "on").lower() in ("off", "false", "0"):
+            return
+        if ws is None or ws is not self.ws or not self.owner_uin():
+            return
+        async with self.status_lock:
+            now = time.time()
+            status, label = qq_status.choose(now, last_user_at=self.last_user_at,
+                                             love_until=self.love_until)
+            if status == self.last_status:
+                return
+            if not urgent and self.last_status_at and time.monotonic() - self.last_status_at < 20 * 60:
+                return
+            try:
+                await asyncio.wait_for(self.action(ws, "set_online_status", {
+                    "status": status[0], "ext_status": status[1], "battery_status": 0,
+                }), timeout=5)
+            except Exception as exc:
+                print(f"QQ display status unavailable: {type(exc).__name__}", flush=True)
+                return
+            self.last_status = status
+            self.last_status_at = time.monotonic()
+            print(f"QQ display status updated: {label}", flush=True)
+
+    async def _status_loop(self, ws):
+        while True:
+            try:
+                await self._refresh_status(ws)
+            except Exception as exc:
+                print(f"QQ display status check skipped: {type(exc).__name__}", flush=True)
+            await asyncio.sleep(5 * 60)
 
     async def _send_market_sticker(self, ws, sender, sticker):
         await self.action(ws, "send_private_msg", {
@@ -404,6 +442,7 @@ class QQConnector:
                 self.memory.set_setting(self.owner_chat_id, OWNER_KEY, sender)
                 await self._send_text(ws, sender, "连上了。以后在这里说话，我也认得你。")
                 print("QQ primary account paired", flush=True)
+                await self._refresh_status(ws)
             return
         if sender != owner:
             return
@@ -479,6 +518,9 @@ class QQConnector:
             })
             await self._send_replies(ws, sender, response["replies"])
             if not response.get("duplicate"):
+                self.last_user_at = time.time()
+                if qq_status.affectionate(text):
+                    self.love_until = self.last_user_at + qq_status.LOVE_SECONDS
                 await self._maybe_react_or_poke(ws, sender, message_id, text)
                 sent = await self._maybe_send_sticker(
                     ws, sender, text, response["replies"], stickers,
@@ -487,6 +529,10 @@ class QQConnector:
                 )
                 if qq_stickers.explicit_request(text) and stickers and not sent:
                     await self._send_text(ws, sender, "这张表情包没发出去。我先收好，稍后再试。")
+                try:
+                    await self._refresh_status(ws, urgent=True)
+                except Exception as exc:
+                    print(f"QQ display status check skipped: {type(exc).__name__}", flush=True)
         except Exception as exc:
             print(f"QQ message handling failed: {type(exc).__name__}", flush=True)
         finally:
@@ -507,21 +553,30 @@ class QQConnector:
                     max_size=2 * 1024 * 1024, ping_interval=25,
                 ) as ws:
                     self.ws = ws
+                    self.last_status = None
                     print("QQ OneBot private connection ready", flush=True)
-                    async for raw in ws:
+                    status_task = asyncio.create_task(self._status_loop(ws), name="qq-display-status")
+                    try:
+                        async for raw in ws:
+                            try:
+                                event = json.loads(raw)
+                                if not isinstance(event, dict):
+                                    continue
+                                echo = event.get("echo")
+                                if echo in self.pending:
+                                    future = self.pending[echo]
+                                    if not future.done():
+                                        future.set_result(event)
+                                else:
+                                    asyncio.create_task(self.handle_event(ws, event))
+                            except (ValueError, TypeError) as exc:
+                                print(f"QQ OneBot event skipped: {type(exc).__name__}", flush=True)
+                    finally:
+                        status_task.cancel()
                         try:
-                            event = json.loads(raw)
-                            if not isinstance(event, dict):
-                                continue
-                            echo = event.get("echo")
-                            if echo in self.pending:
-                                future = self.pending[echo]
-                                if not future.done():
-                                    future.set_result(event)
-                            else:
-                                asyncio.create_task(self.handle_event(ws, event))
-                        except (ValueError, TypeError) as exc:
-                            print(f"QQ OneBot event skipped: {type(exc).__name__}", flush=True)
+                            await status_task
+                        except asyncio.CancelledError:
+                            pass
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
