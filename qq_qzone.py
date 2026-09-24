@@ -16,6 +16,7 @@ AUTO_ENABLED_KEY = 'qq_qzone_auto_enabled_v1'
 AUTO_NEXT_THOUGHT_KEY = 'qq_qzone_auto_next_thought_v2'
 AUTO_LAST_POST_KEY = 'qq_qzone_auto_last_post_v1'
 AUTO_LAST_CONTENT_KEY = 'qq_qzone_auto_last_content_v1'
+LAST_TOPIC_AT_KEY = 'qq_qzone_last_topic_at_v1'
 BEIJING = ZoneInfo('Asia/Shanghai')
 
 
@@ -51,6 +52,24 @@ def command(text):
         r'^(?:你|老公)?(?:现在|赶紧|快|去|就|直接)?(?:发|发表)', value,
     ):
         return 'immediate', ''
+    return None
+
+
+def topic_mentioned(text):
+    return bool(re.search(r'QQ空间|空间说说|(?:发|发表|写|看).{0,5}说说|说说.{0,6}(?:发|发表|看)', text))
+
+
+def contextual_command(text):
+    """Handle short follow-ups only when the conversation is about QQ Space."""
+    value = text.strip(' 。！!？?，,')
+    if re.fullmatch(r'(?:那|就|你|老公|现在|直接|赶紧|快|去|可以|给我|嗯|好|行|的|吧|啊|呀|嘛|先|再|就这样)*发(?:吧|一下|一条|出去|说说)?(?:老公|亲爱的|吧|呀|啊|嘛)?', value):
+        return 'immediate', ''
+    if re.fullmatch(r'(?:你|老公)?(?:发了没|发了吗|发了没有|发成功了吗|发没发|到底发了没)', value):
+        return 'status', ''
+    if re.fullmatch(r'(?:我|给我|让我|发给我|你让我)?(?:看一下|看看|看下|看一眼|看看截图|发截图|发个截图|给我看看|给我看一下)', value):
+        return 'view', ''
+    if re.fullmatch(r'(?:根本|明明|还是|我看|我这边|这里)?(?:没有|没发|看不到|找不到|没有啊|什么都没有)', value):
+        return 'missing', ''
     return None
 
 
