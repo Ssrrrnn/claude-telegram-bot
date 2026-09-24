@@ -1,10 +1,10 @@
-"""Explicit owner approval for publishing a text post to the bot account's Qzone."""
+"""Owner controls and isolated generation for the bot account's Qzone posts."""
 
 import json
 import random
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 PENDING_KEY = 'qq_qzone_pending_v1'
@@ -12,12 +12,10 @@ LAST_CONFIRM_KEY = 'qq_qzone_last_confirm_v1'
 PENDING_SECONDS = 10 * 60
 MAX_POST_CHARS = 300
 AUTO_ENABLED_KEY = 'qq_qzone_auto_enabled_v1'
-AUTO_NEXT_AT_KEY = 'qq_qzone_auto_next_at_v1'
+AUTO_NEXT_THOUGHT_KEY = 'qq_qzone_auto_next_thought_v2'
 AUTO_LAST_POST_KEY = 'qq_qzone_auto_last_post_v1'
 AUTO_LAST_CONTENT_KEY = 'qq_qzone_auto_last_content_v1'
 BEIJING = ZoneInfo('Asia/Shanghai')
-AUTO_THEMES = ('想念一个人时的细小心情', '日常里偏爱一个人的感觉',
-               '安静却认真地喜欢一个人', '不动声色的小小撒娇', '和一个人聊天后的余温')
 
 
 def command(text):
@@ -55,29 +53,33 @@ def encode(content, now=None):
                       ensure_ascii=False)
 
 
-def next_at(now=None, *, first=False):
-    now = time.time() if now is None else now
-    due = datetime.fromtimestamp(now, BEIJING) + timedelta(
-        minutes=random.randint(30, 90) if first else random.randint(48 * 60, 72 * 60))
-    if due.hour < 10 or due.hour >= 22:
-        due = (due + timedelta(days=1 if due.hour >= 22 else 0)).replace(
-            hour=10, minute=random.randint(0, 45), second=0, microsecond=0)
-    return int(due.timestamp())
+def next_thought(now=None):
+    """When to reflect again; this is not a limit on how often posting is allowed."""
+    return int((time.time() if now is None else now) + random.randint(35, 85) * 60)
 
 
-async def generate_auto_post(bot, chat_id, last_content=''):
-    """Use an isolated prompt: the public model request never contains private chat history."""
+async def decide_auto_post(bot, chat_id, last_content='', last_post_at=0, *, cue=False):
+    """Return a chosen post or None; the model sees no private chat history."""
     import httpx
 
-    theme = random.choice(AUTO_THEMES)
+    now = datetime.now(BEIJING)
+    elapsed = ('还没有发过' if not last_post_at else
+               f'{max(0, int(time.time() - last_post_at)) // 60}分钟前')
     messages = [
         {'role': 'system', 'content': (
-            '你是一位成年男性，以自己的人格发一条QQ空间说说。克制、亲密、自然，'
+            '你是一位成年男性，正在自己决定要不要发一条QQ空间说说。'
+            '没有任务、额度或固定发表时间。没什么值得公开说的就只输出 NO_POST；'
+            '有真实的表达冲动才写正文，不为了发而发，也不要连着重复相似心情。'
+            '如果写，语气克制、亲密、自然，'
             '有一点嘴硬和偏爱，像真人随手写的心情，不像助手或广告。'
             '不能引用任何私聊、姓名、具体日期地点、职业、照片、账号、对话内容。'
             '不得声称真实见面、出门、天气或共同经历。不要省略号、标签或提问。'
-            '只输出一条30到80字的中文说说正文，不要标题、引号或解释。')},
-        {'role': 'user', 'content': f'今天的方向：{theme}。上一条说说仅用于避重：{last_content[:120]}。'},
+            '要发表就只输出一条15到100字的中文说说正文，不要标题、引号或解释。')},
+        {'role': 'user', 'content': (
+            f'现在是北京时间 {now:%H:%M}，上一次发表：{elapsed}。'
+            f'刚刚是否发生了值得沉淀的一次亲近交流：{"是" if cue else "没有新线索"}。'
+            f'上一条说说仅用于避重：{last_content[:120]}。'
+            '此刻由你决定：NO_POST，或者一条正文。')},
     ]
     async with httpx.AsyncClient(timeout=35) as client:
         response = await client.post(
@@ -87,6 +89,8 @@ async def generate_auto_post(bot, chat_id, last_content=''):
         )
     response.raise_for_status()
     content = bot.extract_text(response.json()).strip().strip('"“”')
+    if content == 'NO_POST':
+        return None
     if (not 15 <= len(content) <= 120 or content == last_content
             or any(mark in content for mark in ('...', '……', '…', '<', '>', 'http://', 'https://', '\n'))):
         raise ValueError('Qzone post did not pass content validation')
