@@ -78,12 +78,13 @@ class QQTests(unittest.IsolatedAsyncioTestCase):
         await connector.handle_event(None, {**base, "message_id": 1,
             "message": [{"type": "mface", "data": sticker}]})
         self.assertEqual(len(qq_stickers.load(memory.get_setting(42, qq_stickers.SETTING_KEY))), 1)
-        self.assertEqual(len(sent), 1)  # Receiving it does not immediately echo it back.
+        self.assertEqual(len([name for name, _ in sent if name == "send_private_msg"]), 1)
 
         await connector.handle_event(None, {**base, "message_id": 2,
             "message": [{"type": "text", "data": {"text": "给我发个表情包"}}]})
-        self.assertEqual(len(sent), 3)
-        self.assertEqual(sent[-1][1]["message"], [{"type": "mface", "data": sticker}])
+        self.assertEqual(len([name for name, _ in sent if name == "send_private_msg"]), 3)
+        self.assertEqual([params for name, params in sent if name == "send_private_msg"][-1]["message"],
+                         [{"type": "mface", "data": sticker}])
         self.assertTrue(memory.get_setting(42, qq_stickers.LAST_SENT_KEY))
 
     def test_sticker_requests_respect_negation_and_saved_stickers_are_bounded(self):
@@ -123,7 +124,7 @@ class QQTests(unittest.IsolatedAsyncioTestCase):
         connector.gateway = None
         await connector.handle_event(None, {**base, "message_id": 43, "message": [
             {"type": "text", "data": {"text": "发表情包给我"}}]})
-        self.assertEqual(sent[-1][1]["message"], [{"type": "image", "data": {
+        self.assertEqual([p for name, p in sent if name == "send_private_msg"][-1]["message"], [{"type": "image", "data": {
             "file": "sticker.gif", "sub_type": 1}}])
 
     async def test_sticker_request_recovers_images_from_owner_history_only(self):
@@ -150,7 +151,7 @@ class QQTests(unittest.IsolatedAsyncioTestCase):
         await connector.handle_event(None, {"post_type": "message", "message_type": "private",
             "self_id": 88888888, "user_id": 12345678, "message_id": 4,
             "message": [{"type": "text", "data": {"text": "来张表情包"}}]})
-        self.assertEqual(sent[-1][1]["message"][0]["data"]["file"], "owner.gif")
+        self.assertEqual([p for name, p in sent if name == "send_private_msg"][-1]["message"][0]["data"]["file"], "owner.gif")
         self.assertEqual([item["file"] for item in qq_stickers.load(
             memory.get_setting(42, qq_stickers.SETTING_KEY))], ["owner.gif"])
 
@@ -181,7 +182,8 @@ class QQTests(unittest.IsolatedAsyncioTestCase):
                  "message": [{"type": "text", "data": {"text": "给我发个表情包"}}]}
         await connector.handle_event(None, event)
         expected = {"emoji_package_id": 12, "emoji_id": "market-1", "key": "qq-market-key", "summary": "抱抱"}
-        self.assertEqual(sent[-1][1]["message"], [{"type": "mface", "data": expected}])
+        self.assertEqual([p for name, p in sent if name == "send_private_msg"][-1]["message"],
+                         [{"type": "mface", "data": expected}])
         self.assertEqual(len(qq_stickers.load(memory.get_setting(42, qq_stickers.SETTING_KEY))), 2)
         await connector.handle_event(None, {**event, "message_id": 5})
         self.assertEqual(len([name for name, _ in sent if name == "get_friend_msg_history"]), 1)
@@ -247,6 +249,74 @@ class QQTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(received, [("[用户发送了一张图片或表情包]", "YWJj", "image/jpeg")])
         self.assertEqual(sent, ["看到了。"])
+
+    async def test_qq_voice_is_transcribed_and_keeps_voice_reply_mode(self):
+        memory = FakeMemory()
+        memory.set_setting(42, "qq_owner_uin_v1", "12345678")
+        received, sent = [], []
+
+        async def handler(update, context):
+            received.append((update.message.text, update.message.from_voice))
+            await update.message.reply_text("听见了。")
+
+        connector = QQConnector(owner_chat_id=42, pair_code="secret-pairing-code-123",
+                                expected_self_uin="88888888", handler=handler, bot=object(), memory=memory)
+
+        async def action(ws, name, params):
+            sent.append((name, params))
+            return {"text": "今天好想你"} if name == "fetch_ptt_text" else {}
+
+        connector.action = action
+        await connector.handle_event(None, {"post_type": "message", "message_type": "private",
+            "self_id": 88888888, "user_id": 12345678, "message_id": 4,
+            "message": [{"type": "record", "data": {"file": "record-id"}}]})
+        self.assertEqual(received, [("今天好想你", True)])
+        self.assertEqual([p["message"] for n, p in sent if n == "send_private_msg"], ["听见了。"])
+        self.assertEqual([p["event_type"] for n, p in sent if n == "set_input_status"], [1, 0])
+
+    async def test_qq_voice_transcription_failure_gets_a_reply(self):
+        memory = FakeMemory()
+        memory.set_setting(42, "qq_owner_uin_v1", "12345678")
+        connector = QQConnector(owner_chat_id=42, pair_code="secret-pairing-code-123",
+                                expected_self_uin="88888888", handler=AsyncMock(), bot=object(), memory=memory)
+        sent = []
+
+        async def action(ws, name, params):
+            sent.append((name, params))
+            return {"text": ""}
+
+        connector.action = action
+        await connector.handle_event(None, {"post_type": "message", "message_type": "private",
+            "self_id": 88888888, "user_id": 12345678, "message_id": 5,
+            "message": [{"type": "record", "data": {"file": "record-id"}}]})
+        connector.handler.assert_not_awaited()
+        self.assertEqual([p["message"] for n, p in sent if n == "send_private_msg"],
+                         ["刚才那段语音没听清，打字告诉我，好吗？"])
+
+    async def test_saved_custom_faces_are_only_sent_from_qq_media_hosts(self):
+        memory = FakeMemory()
+        connector = QQConnector(owner_chat_id=42, pair_code="secret-pairing-code-123",
+                                expected_self_uin="88888888", handler=None, bot=object(), memory=memory)
+        sent = []
+
+        async def action(ws, name, params):
+            sent.append((name, params))
+            if name == "fetch_custom_face_detail":
+                return [{"url": "http://gchat.qpic.cn/face.gif", "desc": "抱抱"},
+                        {"url": "http://localhost/internal", "desc": "不可信"},
+                        {"url": "https://bad.example/a", "desc": "不可信"}]
+            return {}
+
+        connector.action = action
+        saved = await connector._saved_custom_faces(None)
+        self.assertEqual(saved, [{"kind": "saved_custom", "url": "https://gchat.qpic.cn/face.gif",
+                                  "summary": "抱抱"}])
+        self.assertEqual(await connector._saved_custom_faces(None), saved)
+        self.assertEqual(len([n for n, _ in sent if n == "fetch_custom_face_detail"]), 1)
+        self.assertEqual(qq_stickers.fitting_stickers(saved, "来抱一下。"), saved)
+        self.assertTrue(await connector._maybe_send_sticker(None, "12345678", "发个收藏的表情包", [], saved))
+        self.assertEqual([p for n, p in sent if n == "send_private_msg"][-1]["message"],
+                         [{"type": "image", "data": {"file": "https://gchat.qpic.cn/face.gif"}}])
 
     def test_first_upgrade_recovers_last_human_platform(self):
         class Memory:

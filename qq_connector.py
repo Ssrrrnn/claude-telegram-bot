@@ -18,6 +18,9 @@ OWNER_KEY = "qq_owner_uin_v1"
 PLATFORM_KEY = "last_active_platform_v1"
 MAX_MESSAGE_CHARS = 4000
 MAX_IMAGE_BYTES = 4_000_000
+CUSTOM_FACE_REFRESH_SECONDS = 24 * 60 * 60
+REACTION_COOLDOWN_SECONDS = 4 * 60 * 60
+POKE_COOLDOWN_SECONDS = 12 * 60 * 60
 
 
 def _qq_image_url(value):
@@ -87,6 +90,8 @@ def _message_parts(event):
         elif kind == "image":
             images.append(data)
             parts.append("[用户发送了一张图片或表情包]")
+        elif kind == "record":
+            parts.append("[语音消息]")
     return "".join(parts).strip(), images
 
 
@@ -128,6 +133,10 @@ class QQConnector:
         self.gateway_uin = None
         self.ws = None
         self.owner_event_lock = asyncio.Lock()
+        self.custom_faces = []
+        self.custom_faces_fetched_at = 0
+        self.last_reaction_at = 0
+        self.last_poke_at = 0
 
     def owner_uin(self):
         configured = os.getenv("QQ_OWNER_UIN", "").strip()
@@ -166,6 +175,11 @@ class QQConnector:
         })
 
     async def _send_sticker(self, ws, sender, sticker):
+        if sticker.get("kind") == "saved_custom":
+            await self.action(ws, "send_private_msg", {
+                "user_id": int(sender), "message": [{"type": "image", "data": {"file": sticker["url"]}}],
+            })
+            return
         if sticker.get("kind") != "image":
             return await self._send_market_sticker(ws, sender, sticker)
         file = sticker["file"]
@@ -197,6 +211,35 @@ class QQConnector:
             self.memory.set_setting(self.owner_chat_id, qq_stickers.SETTING_KEY,
                                     json.dumps(stickers, ensure_ascii=False))
         return stickers
+
+    async def _saved_custom_faces(self, ws):
+        """List this account's saved expressions without retaining remote media URLs in memory DB."""
+        if self.custom_faces_fetched_at and time.monotonic() - self.custom_faces_fetched_at < CUSTOM_FACE_REFRESH_SECONDS:
+            return self.custom_faces
+        try:
+            try:
+                raw = await self.action(ws, "fetch_custom_face_detail", {"count": 48})
+                if not isinstance(raw, list):
+                    raise ValueError("Unexpected custom face detail response")
+            except Exception:
+                raw = await self.action(ws, "fetch_custom_face", {"count": 48})
+            if not isinstance(raw, list):
+                raise ValueError("Unexpected custom face response")
+            faces = []
+            for value in raw[:48]:
+                url = _qq_image_url(value.get("url") if isinstance(value, dict) else value)
+                if not url or len(url) > 2048:
+                    continue
+                summary = value.get("desc") if isinstance(value, dict) else ""
+                faces.append({"kind": "saved_custom", "url": url,
+                              "summary": str(summary).strip()[:80] or "[收藏表情]"})
+            self.custom_faces = faces
+            self.custom_faces_fetched_at = time.monotonic()
+        except Exception as exc:
+            print(f"QQ saved expressions unavailable: {type(exc).__name__}", flush=True)
+            # A missing extension should not stall every incoming message.
+            self.custom_faces_fetched_at = time.monotonic()
+        return self.custom_faces
 
     async def _recover_owner_stickers(self, ws, sender, stickers, *, market_only=False):
         """Recover recent images already sent by the paired owner, on demand."""
@@ -243,7 +286,9 @@ class QQConnector:
             return False
         if requested:
             # Native market faces preserve QQ's sticker animation and identity.
-            candidates = [item for item in stickers if "emoji_id" in item] or stickers
+            saved = [item for item in stickers if item.get("kind") == "saved_custom"]
+            market = [item for item in stickers if "emoji_id" in item]
+            candidates = saved if "收藏" in user_text and saved else market or saved or stickers
         else:
             if len(stickers) < 2:
                 return False
@@ -286,6 +331,26 @@ class QQConnector:
                     await self._send_text(ws, sender, reply["fallback_text"])
             elif reply.get("type") == "text":
                 await self._send_text(ws, sender, reply.get("text", ""))
+
+    async def _maybe_react_or_poke(self, ws, sender, message_id, text):
+        """Keep native QQ gestures rare and only use them for clear affectionate cues."""
+        now = time.monotonic()
+        if any(phrase in text for phrase in ("戳戳我", "戳我一下", "戳一下我")):
+            if not self.last_poke_at or now - self.last_poke_at >= POKE_COOLDOWN_SECONDS:
+                try:
+                    await self.action(ws, "send_poke", {"user_id": sender})
+                    self.last_poke_at = now
+                except Exception as exc:
+                    print(f"QQ poke unavailable: {type(exc).__name__}", flush=True)
+        elif any(phrase in text for phrase in ("只喜欢你", "我爱你", "想你了", "好喜欢你")):
+            if not self.last_reaction_at or now - self.last_reaction_at >= REACTION_COOLDOWN_SECONDS:
+                try:
+                    await self.action(ws, "set_msg_emoji_like", {
+                        "message_id": message_id, "emoji_id": "66", "set": True,
+                    })
+                    self.last_reaction_at = now
+                except Exception as exc:
+                    print(f"QQ reaction unavailable: {type(exc).__name__}", flush=True)
 
     async def _image_content(self, ws, data):
         url = _qq_image_url(data.get("url"))
@@ -353,8 +418,22 @@ class QQConnector:
         if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
             return
         text, images = _message_parts(event)
+        segments = event.get("message")
+        record = isinstance(segments, list) and any(isinstance(segment, dict) and
+                     segment.get("type") == "record" for segment in segments)
         if not text or len(text) > MAX_MESSAGE_CHARS:
             return
+        if record:
+            try:
+                transcription = await self.action(ws, "fetch_ptt_text", {"message_id": message_id})
+                transcript = transcription.get("text", "").strip() if isinstance(transcription, dict) else ""
+                if not transcript or len(transcript) > MAX_MESSAGE_CHARS:
+                    raise ValueError("QQ voice transcription unavailable")
+                text = (text.replace("[语音消息]", "").strip() + " " + transcript).strip()
+            except Exception as exc:
+                print(f"QQ voice transcription unavailable: {type(exc).__name__}", flush=True)
+                await self._send_text(ws, sender, "刚才那段语音没听清，打字告诉我，好吗？")
+                return
         try:
             stickers = await self._remember_stickers(event)
         except Exception as exc:
@@ -368,6 +447,12 @@ class QQConnector:
                 recently_scanned = False
             if not recently_scanned:
                 stickers = await self._recover_owner_stickers(ws, sender, stickers, market_only=bool(stickers))
+        if qq_stickers.explicit_request(text):
+            saved_faces = await self._saved_custom_faces(ws)
+        else:
+            saved_faces = self.custom_faces
+        if saved_faces:
+            stickers = stickers + saved_faces
         image_base64 = image_mime = None
         if images:
             try:
@@ -379,14 +464,22 @@ class QQConnector:
             if len(images) > 1:
                 text += f"（这条消息还有{len(images) - 1}张图未能查看，只针对第一张回应。）"
         try:
+            try:
+                await asyncio.wait_for(self.action(ws, "set_input_status", {
+                    "user_id": sender, "event_type": 1,
+                }), timeout=3)
+            except Exception:
+                pass
             response = await self._gateway(owner).process({
                 "sender_id": sender, "message_id": message_id, "text": text,
+                "from_voice": record,
                 "image_base64": image_base64, "image_mime": image_mime,
                 "qq_sticker_status": ("available" if stickers else "empty")
                 if qq_stickers.explicit_request(text) else None,
             })
             await self._send_replies(ws, sender, response["replies"])
             if not response.get("duplicate"):
+                await self._maybe_react_or_poke(ws, sender, message_id, text)
                 sent = await self._maybe_send_sticker(
                     ws, sender, text, response["replies"], stickers,
                     incoming_sticker=any(segment.get("type") == "mface" for segment in event.get("message", [])
@@ -396,6 +489,13 @@ class QQConnector:
                     await self._send_text(ws, sender, "这张表情包没发出去。我先收好，稍后再试。")
         except Exception as exc:
             print(f"QQ message handling failed: {type(exc).__name__}", flush=True)
+        finally:
+            try:
+                await asyncio.wait_for(self.action(ws, "set_input_status", {
+                    "user_id": sender, "event_type": 0,
+                }), timeout=3)
+            except Exception:
+                pass
 
     async def run(self, url, token):
         from websockets.asyncio.client import connect
