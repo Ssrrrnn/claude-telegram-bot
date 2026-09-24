@@ -172,7 +172,8 @@ class QQConnector:
         # NapCat's filename cache is local and expires. Reading the original
         # message restores its media reference after a restart when possible.
         try:
-            original = await self.action(ws, "get_msg", {"message_id": sticker["message_id"]})
+            original = await asyncio.wait_for(
+                self.action(ws, "get_msg", {"message_id": sticker["message_id"]}), timeout=5)
             if isinstance(original, dict):
                 for segment in original.get("message", []):
                     if isinstance(segment, dict) and segment.get("type") == "image":
@@ -246,7 +247,7 @@ class QQConnector:
         choices = random.sample(candidates, len(candidates)) if requested else [random.choice(candidates)]
         if requested:
             choices.sort(key=lambda item: item.get("kind") == "image" and item.get("sub_type") == 0)
-        for sticker in choices:
+        for sticker in choices[:3]:
             try:
                 await self._send_sticker(ws, sender, sticker)
                 self.memory.set_setting(self.owner_chat_id, qq_stickers.LAST_SENT_KEY, str(time.time()))
