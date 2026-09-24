@@ -187,6 +187,10 @@ class QQConnector:
             await ws.send(json.dumps({"action": name, "params": params, "echo": echo}, ensure_ascii=False))
             result = await asyncio.wait_for(future, timeout=20)
             if result.get("status") != "ok":
+                if name == 'send_qzone_msg':
+                    raise RuntimeError('Qzone publish rejected: retcode='
+                                       + str(result.get('retcode')) + ', message='
+                                       + str(result.get('message') or result.get('wording') or '')[:180])
                 raise RuntimeError(f"OneBot action {name} failed")
             return result.get("data")
         finally:
@@ -273,19 +277,45 @@ class QQConnector:
                 return '用户引用了一条消息，但内容暂时无法读取'
         return None
 
-    async def _handle_qzone_command(self, ws, sender, message_id, text):
-        parsed = qq_qzone.command(text)
+    def _qzone_context_active(self):
+        try:
+            last_topic = float(self.memory.get_setting(self.owner_chat_id, qq_qzone.LAST_TOPIC_AT_KEY) or 0)
+            if 0 <= time.time() - last_topic < 4 * 3600:
+                return True
+            # Bootstrap the topic from persisted QQ turns after a rolling deploy.
+            with self.memory._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT user_text FROM recent_conversation "
+                        "WHERE chat_id = %s AND telegram_message_id < 0 "
+                        "AND created_at > NOW() - INTERVAL '4 hours' "
+                        "ORDER BY id DESC LIMIT 24",
+                        (self.owner_chat_id,),
+                    )
+                    return any(qq_qzone.topic_mentioned(row.get('user_text') or '')
+                               for row in cur.fetchall())
+        except Exception as exc:
+            print(f'QQ Qzone topic lookup skipped: {type(exc).__name__}', flush=True)
+            return False
+
+    async def _handle_qzone_command(self, ws, sender, message_id, text, *, parsed=None):
+        parsed = parsed or qq_qzone.command(text)
         if not parsed:
             return False
         kind, detail = parsed
-        if kind == 'status':
+        if kind in ('status', 'view', 'missing'):
             last_at = int(self.memory.get_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_POST_KEY) or 0)
             last_content = self.memory.get_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_CONTENT_KEY) or ''
             if last_at:
                 date = datetime.fromtimestamp(last_at, qq_qzone.BEIJING).strftime('%m月%d日 %H:%M')
-                message = f'我这里确认上次发表是在{date}。' + (f'那条写的是：{last_content}' if last_content else '')
+                message = (f'发表接口上次确认成功是在{date}。'
+                           + (f'正文是：{last_content}' if last_content else '')
+                           + ('我没有可发的空间截图；如果你那里看不到，我会按实际情况排查。'
+                              if kind != 'status' else ''))
             else:
-                message = '我这里还没有确认发表成功的说说记录。'
+                message = ('你说得对，刚才我说发了是错的。我这里没有确认发表成功的记录，'
+                           '也没有截图可以给你看。' if kind in ('view', 'missing')
+                           else '我这里还没有确认发表成功的说说记录。')
             await self._send_text(ws, sender, message)
             return True
         if kind.startswith('auto_'):
@@ -579,7 +609,10 @@ class QQConnector:
                 if reply.get("fallback_text"):
                     await self._send_text(ws, sender, reply["fallback_text"])
             elif reply.get("type") == "text":
-                await self._send_text(ws, sender, reply.get("text", ""))
+                value = reply.get('text', '')
+                if isinstance(value, str) and '<image_placeholder>' in value:
+                    value = value.replace('<image_placeholder>', '').strip() or '这张图我现在拿不到，先不假装发给你。'
+                await self._send_text(ws, sender, value)
 
     async def _maybe_react_or_poke(self, ws, sender, message_id, text):
         """Keep native QQ gestures rare and only use them for clear affectionate cues."""
@@ -688,7 +721,15 @@ class QQConnector:
                 print(f"QQ voice transcription unavailable: {type(exc).__name__}", flush=True)
                 await self._send_text(ws, sender, "刚才那段语音没听清，打字告诉我，好吗？")
                 return
-        if await self._handle_qzone_command(ws, sender, message_id, text):
+        if qq_qzone.topic_mentioned(text):
+            try:
+                self.memory.set_setting(self.owner_chat_id, qq_qzone.LAST_TOPIC_AT_KEY, str(int(time.time())))
+            except Exception as exc:
+                print(f'QQ Qzone topic state unavailable: {type(exc).__name__}', flush=True)
+        parsed = qq_qzone.command(text)
+        if not parsed and qq_qzone.contextual_command(text) and self._qzone_context_active():
+            parsed = qq_qzone.contextual_command(text)
+        if parsed and await self._handle_qzone_command(ws, sender, message_id, text, parsed=parsed):
             return
         quoted_context = await self._quoted_context(ws, event, sender)
         game = _requested_game(text)
