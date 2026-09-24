@@ -96,11 +96,20 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_recent_qq_contact_receives_single_proactive_in_qq(self):
         self.settings[1, 'last_active_platform_v1'] = 'qq'
-        qq = types.SimpleNamespace(send_proactive=AsyncMock(return_value=False))
+        qq = types.SimpleNamespace(ws=object(), send_proactive=AsyncMock(return_value=False))
         self.telegram.bot_data = {'qq_connector': qq}
         await self.app._proactive_tick(self.telegram)
         qq.send_proactive.assert_awaited_once()
         self.telegram.bot.send_message.assert_not_awaited()
+        self.assertEqual(self.app._load_state(1)['silence_count'], 1)
+
+    async def test_disconnected_qq_proactive_reaches_telegram(self):
+        self.settings[1, 'last_active_platform_v1'] = 'qq'
+        qq = types.SimpleNamespace(ws=None, send_proactive=AsyncMock())
+        self.telegram.bot_data = {'qq_connector': qq}
+        await self.app._proactive_tick(self.telegram)
+        qq.send_proactive.assert_not_awaited()
+        self.telegram.bot.send_message.assert_awaited()
         self.assertEqual(self.app._load_state(1)['silence_count'], 1)
 
     async def test_auto_proactive_can_send_voice_and_save_cooldown(self):
