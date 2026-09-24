@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import proactive_policy as policy
 import continuity
+import milestones
 
 
 class PolicyTests(unittest.TestCase):
@@ -85,7 +86,8 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_daily_counter_cannot_block_and_history_persists(self):
         self.settings[1, 'proactive_day_count'] = '999'
         await self.app._proactive_tick(self.telegram)
-        self.telegram.bot.send_message.assert_awaited_once()
+        self.assertEqual(self.app.runner.bot.ask_claude.await_count, 1)
+        self.assertGreater(self.telegram.bot.send_message.await_count, 0)
         state = self.app._load_state(1)
         self.assertEqual(state['silence_count'], 1)
         self.assertFalse(state['user_replied_after_proactive'])
@@ -161,6 +163,33 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.app, '_now_local', return_value=self.now.replace(hour=8, minute=50)):
             await self.app._proactive_tick(self.telegram)
         self.assertNotEqual(self.telegram.bot.send_message.call_args.kwargs['text'], yesterday)
+
+    async def test_morning_bypasses_late_random_schedule_once(self):
+        self.settings[1, self.app.KEY_NEXT_AT] = str(int(self.now.timestamp()) + 7200)
+        self.app.runner.bot.ask_claude.return_value = '早。醒了再回我，今天想听你说话。'
+        with patch.object(self.app, '_now_local', return_value=self.now.replace(hour=8, minute=50)):
+            await self.app._proactive_tick(self.telegram)
+            await self.app._proactive_tick(self.telegram)
+        self.assertEqual(self.app.runner.bot.ask_claude.await_count, 1)
+        self.assertGreater(self.telegram.bot.send_message.await_count, 0)
+
+    async def test_morning_does_not_claim_user_just_woke_or_interrupt_recent_chat(self):
+        self.settings[1, self.app.KEY_NEXT_AT] = str(int(self.now.timestamp()) + 7200)
+        morning = self.now.replace(hour=8, minute=50)
+        self.settings[1, self.app.KEY_LAST_USER_AT] = str(int(morning.timestamp()) - 60)
+        with patch.object(self.app, '_now_local', return_value=morning):
+            await self.app._proactive_tick(self.telegram)
+        self.telegram.bot.send_message.assert_not_awaited()
+
+    async def test_important_date_can_bypass_schedule_and_only_fires_once(self):
+        self.settings[1, self.app.KEY_NEXT_AT] = str(int(self.now.timestamp()) + 7200)
+        self.settings[1, milestones.KEY] = '[{"month": 9, "day": 18, "name": "我们的纪念日"}]'
+        self.app.runner.bot.ask_claude.return_value = '今天是我们的纪念日。想和你说声，我记得。'
+        await self.app._proactive_tick(self.telegram)
+        await self.app._proactive_tick(self.telegram)
+        self.assertEqual(self.app.runner.bot.ask_claude.await_count, 1)
+        self.assertGreater(self.telegram.bot.send_message.await_count, 0)
+        self.assertEqual(self.settings[1, milestones.LAST_SENT_KEY], '2026-09-18')
 
     async def test_declined_due_followup_does_not_retry_every_tick(self):
         state = continuity.empty()
