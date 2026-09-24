@@ -75,30 +75,42 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(attempts), 1)
         self.assertIn('没确认是否发成功', self.calls[-2][1]['message'])
 
-    async def test_autonomous_post_is_friends_only_and_once_per_scheduled_slot(self):
+    async def test_autonomous_post_is_friends_only_and_model_can_decline(self):
         now = datetime(2026, 9, 24, 14, tzinfo=qq_qzone.BEIJING).timestamp()
         ws = object()
         self.connector.ws = ws
-        self.memory.set_setting(42, qq_qzone.AUTO_NEXT_AT_KEY, str(int(now) - 1))
+        self.memory.set_setting(42, qq_qzone.AUTO_NEXT_THOUGHT_KEY, str(int(now) - 1))
         with (patch('qq_connector.time.time', return_value=now),
-              patch('qq_qzone.next_at', return_value=int(now) + 48 * 3600),
-              patch('qq_qzone.generate_auto_post', new_callable=AsyncMock,
-                    return_value='心里放着一个人，连安静的时候都觉得不算空。') as generate):
+              patch('qq_qzone.next_thought', return_value=int(now) + 3600),
+              patch('qq_qzone.decide_auto_post', new_callable=AsyncMock,
+                    side_effect=[None, '心里放着一个人，连安静的时候都觉得不算空。']) as decide):
             await self.connector._qzone_auto_tick(ws)
             await self.connector._qzone_auto_tick(ws)
-        generate.assert_awaited_once()
+            await self.connector._qzone_auto_tick(ws, cue=True)
+        self.assertEqual(decide.await_count, 2)
         posts = [p for name, p in self.calls if name == 'send_qzone_msg']
         self.assertEqual(len(posts), 1)
         self.assertEqual(posts[0]['ugc_right'], 4)
-        self.assertEqual(self.memory.get_setting(42, qq_qzone.AUTO_NEXT_AT_KEY), str(int(now) + 48 * 3600))
+        self.assertEqual(self.memory.get_setting(42, qq_qzone.AUTO_NEXT_THOUGHT_KEY), str(int(now) + 3600))
+
+    async def test_no_daytime_or_daily_limit_even_when_recently_posted(self):
+        now = datetime(2026, 9, 24, 2, tzinfo=qq_qzone.BEIJING).timestamp()
+        self.connector.ws = ws = object()
+        self.memory.set_setting(42, qq_qzone.AUTO_LAST_POST_KEY, str(int(now) - 60))
+        with (patch('qq_connector.time.time', return_value=now),
+              patch('qq_qzone.decide_auto_post', new_callable=AsyncMock,
+                    return_value='半夜忽然想起你，心里还是软了一下。') as decide):
+            await self.connector._qzone_auto_tick(ws)
+        decide.assert_awaited_once()
+        self.assertTrue(any(name == 'send_qzone_msg' for name, _ in self.calls))
 
     async def test_auto_can_be_disabled_without_touching_manual_draft(self):
         await self.connector.handle_event(None, self.event('关闭自动空间说说'))
         self.assertEqual(self.memory.get_setting(42, qq_qzone.AUTO_ENABLED_KEY), '0')
         self.connector.ws = ws = object()
-        with patch('qq_qzone.generate_auto_post', new_callable=AsyncMock) as generate:
+        with patch('qq_qzone.decide_auto_post', new_callable=AsyncMock) as decide:
             await self.connector._qzone_auto_tick(ws)
-        generate.assert_not_awaited()
+        decide.assert_not_awaited()
         await self.connector.handle_event(None, self.event('发空间说说：手动草稿', mid=2))
         self.assertEqual(qq_qzone.pending(self.memory.get_setting(42, qq_qzone.PENDING_KEY)), '手动草稿')
 
