@@ -31,15 +31,34 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
                 'self_id': 88888888, 'user_id': user, 'message_id': mid,
                 'message': [{'type': 'text', 'data': {'text': text}}]}
 
-    async def test_explicit_publication_requires_confirmation_and_is_idempotent(self):
+    async def test_explicit_body_publishes_immediately_and_is_idempotent(self):
         await self.connector.handle_event(None, self.event('发空间说说：今天想你了'))
-        self.assertFalse(any(name == 'send_qzone_msg' for name, _ in self.calls))
-        self.assertEqual(qq_qzone.pending(self.memory.get_setting(42, qq_qzone.PENDING_KEY)), '今天想你了')
-        self.assertIn('公开可见', self.calls[-1][1]['message'])
-        await self.connector.handle_event(None, self.event('确认发表空间说说', mid=2))
         posts = [p for name, p in self.calls if name == 'send_qzone_msg']
-        self.assertEqual(posts, [{'content': '今天想你了', 'images': [], 'ugc_right': 1, 'target_uins': []}])
-        await self.connector.handle_event(None, self.event('确认发表空间说说', mid=2))
+        self.assertEqual(posts, [{'content': '今天想你了', 'images': [], 'ugc_right': 4, 'target_uins': []}])
+        self.assertIn('发到 QQ 空间了', self.calls[-1][1]['message'])
+        await self.connector.handle_event(None, self.event('发空间说说：今天想你了'))
+        self.assertEqual(len([name for name, _ in self.calls if name == 'send_qzone_msg']), 1)
+
+    async def test_natural_request_writes_and_publishes_without_model_promise(self):
+        message = '老公你现在可以发说说了你去看一下嘛'
+        self.assertEqual(qq_qzone.command(message), ('immediate', ''))
+        self.assertIsNone(qq_qzone.command('你能发空间说说吗'))
+        self.assertIsNone(qq_qzone.command('别发说说'))
+        with patch('qq_qzone.generate_requested_post', new_callable=AsyncMock,
+                   return_value='想我老婆了。') as generate:
+            await self.connector.handle_event(None, self.event(message))
+        generate.assert_awaited_once()
+        posts = [p for name, p in self.calls if name == 'send_qzone_msg']
+        self.assertEqual(posts[0]['content'], '想我老婆了。')
+        self.assertIn('发到 QQ 空间了', self.calls[-1][1]['message'])
+        self.model.ask_claude.assert_not_awaited()
+
+    async def test_status_only_reports_confirmed_publishes(self):
+        await self.connector.handle_event(None, self.event('说说发了吗'))
+        self.assertIn('还没有确认发表成功', self.calls[-1][1]['message'])
+        await self.connector.handle_event(None, self.event('发空间说说：想我老婆了', mid=2))
+        await self.connector.handle_event(None, self.event('你发说说了吗', mid=3))
+        self.assertIn('想我老婆了', self.calls[-1][1]['message'])
         self.assertEqual(len([name for name, _ in self.calls if name == 'send_qzone_msg']), 1)
 
     async def test_draft_from_model_is_shown_before_any_post(self):
@@ -59,7 +78,6 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(name == 'send_qzone_msg' for name, _ in self.calls))
 
     async def test_timeout_does_not_retry_unknown_publish(self):
-        await self.connector.handle_event(None, self.event('发空间说说：今天想你了'))
         attempts = []
 
         async def uncertain(ws, name, params):
@@ -70,10 +88,10 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
             return {}
 
         self.connector.action = uncertain
-        await self.connector.handle_event(None, self.event('确认发表空间说说', mid=2))
-        await self.connector.handle_event(None, self.event('确认发表空间说说', mid=2))
+        await self.connector.handle_event(None, self.event('发空间说说：今天想你了', mid=2))
+        await self.connector.handle_event(None, self.event('发空间说说：今天想你了', mid=2))
         self.assertEqual(len(attempts), 1)
-        self.assertIn('没确认是否发成功', self.calls[-2][1]['message'])
+        self.assertIn('还不能确认发成功', self.calls[-2][1]['message'])
 
     async def test_autonomous_post_is_friends_only_and_model_can_decline(self):
         now = datetime(2026, 9, 24, 14, tzinfo=qq_qzone.BEIJING).timestamp()
@@ -111,7 +129,8 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
         with patch('qq_qzone.decide_auto_post', new_callable=AsyncMock) as decide:
             await self.connector._qzone_auto_tick(ws)
         decide.assert_not_awaited()
-        await self.connector.handle_event(None, self.event('发空间说说：手动草稿', mid=2))
+        self.model.ask_claude.return_value = '手动草稿'
+        await self.connector.handle_event(None, self.event('写条空间说说：手动草稿', mid=2))
         self.assertEqual(qq_qzone.pending(self.memory.get_setting(42, qq_qzone.PENDING_KEY)), '手动草稿')
 
 
