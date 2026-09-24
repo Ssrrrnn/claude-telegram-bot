@@ -7,7 +7,6 @@ import json
 import os
 import random
 import re
-import socket
 import time
 import uuid
 from datetime import datetime
@@ -28,7 +27,6 @@ CUSTOM_FACE_REFRESH_SECONDS = 24 * 60 * 60
 REACTION_COOLDOWN_SECONDS = 4 * 60 * 60
 POKE_COOLDOWN_SECONDS = 12 * 60 * 60
 OFFLINE_ALERT_DELAY_SECONDS = 120
-QZONE_DIAGNOSTIC_KEY = 'qq_qzone_diagnostic_20260924_ipv6_retest_v2'
 
 
 def _qq_image_url(value):
@@ -169,7 +167,6 @@ class QQConnector:
         self.qzone_auto_lock = asyncio.Lock()
         self.login_failures = 0
         self.account_offline = False
-        self.qzone_network_checked = False
 
     def owner_uin(self):
         configured = os.getenv("QQ_OWNER_UIN", "").strip()
@@ -235,49 +232,11 @@ class QQConnector:
             try:
                 healthy = await self._check_login(ws)
                 if healthy:
-                    await self._probe_qzone_once(ws)
-                    await self._check_qzone_network_once()
                     await self._refresh_status(ws)
             except Exception as exc:
                 print(f"QQ display status check skipped: {type(exc).__name__}", flush=True)
                 healthy = False
             await asyncio.sleep(5 * 60 if healthy else 60)
-
-    async def _check_qzone_network_once(self):
-        if self.qzone_network_checked:
-            return
-        self.qzone_network_checked = True
-        host = 'user.qzone.qq.com'
-        loop = asyncio.get_running_loop()
-        for family, label in ((socket.AF_INET, 'IPv4'), (socket.AF_INET6, 'IPv6')):
-            try:
-                infos = await asyncio.wait_for(loop.getaddrinfo(host, 443, family=family,
-                    type=socket.SOCK_STREAM), timeout=4)
-                if not infos:
-                    raise OSError('no DNS records')
-                async def connect_one(address):
-                    reader, writer = await asyncio.wait_for(asyncio.open_connection(
-                        host=address, port=443, family=family), timeout=4)
-                    writer.close()
-                    await writer.wait_closed()
-                await connect_one(infos[0][4][0])
-                print(f'QQ Qzone network {label}: TCP 443 reachable', flush=True)
-            except Exception as exc:
-                print(f'QQ Qzone network {label}: {type(exc).__name__}: {str(exc)[:100]}', flush=True)
-
-    async def _probe_qzone_once(self, ws):
-        """One authorized live publish test; record intent before the remote call to avoid duplicates."""
-        if ws is not self.ws or not self.owner_uin():
-            return
-        try:
-            if self.memory.get_setting(self.owner_chat_id, QZONE_DIAGNOSTIC_KEY):
-                return
-            self.memory.set_setting(self.owner_chat_id, QZONE_DIAGNOSTIC_KEY, 'attempted')
-            async with self.qzone_auto_lock:
-                tid = await self._post_qzone(ws, '测试一下', visibility=4)
-            print(f'QQ Qzone diagnostic published: tid={tid}', flush=True)
-        except Exception as exc:
-            print(f'QQ Qzone diagnostic failed: {type(exc).__name__}: {str(exc)[:250]}', flush=True)
 
     async def _check_login(self, ws):
         try:
