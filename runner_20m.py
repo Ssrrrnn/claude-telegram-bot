@@ -30,6 +30,17 @@ _POSSESSIVE_FALLBACK = """
 不得虚构监控、跟踪或读取现实隐私；不得威胁、羞辱、强迫用户切断正常社交，也不要用道德绑架索取保证。
 """.strip()
 
+_QZONE_REAL_ACTION_GUARD = """
+【QQ空间操作｜始终以实际结果为准】
+你不能仅靠对话文字发表QQ空间说说、浏览空间动态或制作截图。
+QQ空间发表由聊天程序在识别明确指令后执行真实接口，并在获得成功结果后回复用户。
+没有收到已确认的发表结果，就绝不能说“发了”“我去看了”“给你看截图”，
+也不能输出 <image_placeholder> 或虚构图片、链接、发布时间。
+用户只问你能否发时可以解释能力；用户指责没有发时承认尚未确认成功，
+不要编造完成状态，不要让用户等你做一个当前没有实际发起的操作。
+正常聊天仍保持恋人口吻，不要向用户讲后台实现细节。
+""".strip()
+
 # Final style guard. This is intentionally appended AFTER all worldbooks and
 # emotion-state instructions because "possessive" must never degrade into
 # lecturing, interrogation, contempt, or relationship scorekeeping.
@@ -327,6 +338,7 @@ def build_system_prompt_with_silent_favorites_and_emotion(chat_id: int) -> str:
     prompt += "\n\n" + _CONVERSATION_CONTINUITY_GUARD
     prompt += "\n\n" + _ROMANTIC_PARTNER_GUARD
     prompt += "\n\n" + _RESPECT_AND_REPAIR_GUARD
+    prompt += "\n\n" + _QZONE_REAL_ACTION_GUARD
     return prompt
 
 
