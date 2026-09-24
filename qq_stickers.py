@@ -4,6 +4,7 @@ import json
 
 SETTING_KEY = "qq_market_stickers_v1"
 LAST_SENT_KEY = "qq_market_sticker_last_sent_v1"
+MARKET_DISCOVERY_AT_KEY = "qq_market_sticker_discovery_at_v1"
 MAX_STICKERS = 16
 SPONTANEOUS_COOLDOWN = 90 * 60
 
