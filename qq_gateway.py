@@ -15,10 +15,12 @@ class _Reply:
 
 class _Message:
     def __init__(self, text, message_id, outbox, from_voice=False, image_base64=None, image_mime=None,
-                 qq_sticker_status=None):
+                 qq_sticker_status=None, quoted_context=None, qq_native_status=None):
         self.text, self.message_id, self.from_voice = text, message_id, from_voice
         self.image_base64, self.image_mime = image_base64, image_mime
         self.qq_sticker_status = qq_sticker_status
+        self.quoted_context = quoted_context
+        self.qq_native_status = qq_native_status
         self.source_platform = "qq"
         self.outbox = outbox
 
@@ -84,6 +86,9 @@ class QQGateway:
             raise ValueError("Invalid QQ image contents")
         if audio is not None and len(audio) > 8_000_000:
             raise ValueError("QQ voice is too large")
+        if any(value is not None and (not isinstance(value, str) or len(value) > 400)
+               for value in (data.get('quoted_context'), data.get('qq_native_status'))):
+            raise ValueError("Invalid QQ context")
         if not text.strip() and not audio and not image:
             raise ValueError("Empty QQ message")
 
@@ -105,7 +110,9 @@ class QQGateway:
                 effective_chat=SimpleNamespace(id=self.shared_chat_id),
                 message=_Message(text.strip(), -message_id, outbox, from_voice=from_voice,
                                  image_base64=image, image_mime=image_mime,
-                                 qq_sticker_status=data.get("qq_sticker_status")),
+                                 qq_sticker_status=data.get("qq_sticker_status"),
+                                 quoted_context=data.get('quoted_context'),
+                                 qq_native_status=data.get('qq_native_status')),
             )
             context = SimpleNamespace(bot=_Bot(outbox))
             await self.handler(update, context)
