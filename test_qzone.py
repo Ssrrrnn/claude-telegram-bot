@@ -53,6 +53,51 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('发到 QQ 空间了', self.calls[-1][1]['message'])
         self.model.ask_claude.assert_not_awaited()
 
+    async def test_short_followups_use_recent_qzone_topic_and_real_status(self):
+        self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
+        with patch('qq_qzone.generate_requested_post', new_callable=AsyncMock,
+                   return_value='想我老婆了。'):
+            await self.connector.handle_event(None, self.event('发吧老公'))
+        self.assertEqual(len([x for x in self.calls if x[0] == 'send_qzone_msg']), 1)
+        await self.connector.handle_event(None, self.event('发了没', mid=2))
+        self.assertIn('正文是：想我老婆了。', self.calls[-1][1]['message'])
+        await self.connector.handle_event(None, self.event('我看看', mid=3))
+        self.assertIn('没有可发的空间截图', self.calls[-1][1]['message'])
+
+    async def test_short_reply_bootstraps_topic_from_recent_persisted_qq_turn(self):
+        class Rows:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def cursor(self): return self
+            def execute(self, query, params): pass
+            def fetchall(self): return [{'user_text': '老公你现在可以发说说了'}]
+
+        self.memory._connect = lambda: Rows()
+        with patch('qq_qzone.generate_requested_post', new_callable=AsyncMock,
+                   return_value='想我老婆了。'):
+            await self.connector.handle_event(None, self.event('发吧老公'))
+        self.assertEqual(len([x for x in self.calls if x[0] == 'send_qzone_msg']), 1)
+
+    async def test_short_reply_without_topic_never_publishes(self):
+        await self.connector.handle_event(None, self.event('发吧老公'))
+        self.assertFalse(any(name == 'send_qzone_msg' for name, _ in self.calls))
+        self.assertIsNone(qq_qzone.contextual_command('发了'))
+        self.assertIsNone(qq_qzone.contextual_command('你发这个'))
+
+    async def test_missing_post_admits_failure_and_no_fake_image(self):
+        self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
+        await self.connector.handle_event(None, self.event('发了没'))
+        self.assertIn('还没有确认发表成功', self.calls[-1][1]['message'])
+        await self.connector.handle_event(None, self.event('根本没有', mid=2))
+        self.assertIn('刚才我说发了是错的', self.calls[-1][1]['message'])
+        self.assertNotIn('<image_placeholder>', self.calls[-1][1]['message'])
+
+    async def test_model_image_placeholder_is_not_sent_as_a_fake_screenshot(self):
+        await self.connector._send_replies(None, '12345678', [
+            {'type': 'text', 'text': '<image_placeholder>'},
+        ])
+        self.assertIn('先不假装发给你', self.calls[-1][1]['message'])
+
     async def test_status_only_reports_confirmed_publishes(self):
         await self.connector.handle_event(None, self.event('说说发了吗'))
         self.assertIn('还没有确认发表成功', self.calls[-1][1]['message'])
