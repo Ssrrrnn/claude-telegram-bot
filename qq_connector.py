@@ -340,9 +340,13 @@ class QQConnector:
             return False
         kind, detail = parsed
         if kind == 'help':
-            await self._send_text(ws, sender, '会发。你说“发空间说说：正文”，我就用这段话发表；'
-                                  '或者说“发条说说”，让我自己写。发表成功我会回你正文，'
-                                  '没成功就告诉你没确认成功。')
+            if self.account_offline:
+                await self._send_text(ws, sender, '我接了发空间说说的功能，但 QQ 号现在离线，'
+                                      '重新登录 NapCat 后才能试着发表。')
+            else:
+                await self._send_text(ws, sender, '我这边接了发空间说说的功能。你说“发空间说说：正文”，'
+                                      '我就用这段话尝试发表；或者说“发条说说”，让我自己写。'
+                                      '发表成功我会回你正文，没成功就告诉你没确认成功。')
             return True
         if kind in ('status', 'view', 'missing'):
             last_at = int(self.memory.get_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_POST_KEY) or 0)

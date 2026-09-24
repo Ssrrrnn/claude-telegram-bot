@@ -42,7 +42,7 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
     async def test_natural_request_writes_and_publishes_without_model_promise(self):
         message = '老公你现在可以发说说了你去看一下嘛'
         self.assertEqual(qq_qzone.command(message), ('immediate', ''))
-        self.assertIsNone(qq_qzone.command('你能发空间说说吗'))
+        self.assertEqual(qq_qzone.command('你能发空间说说吗'), ('help', ''))
         self.assertIsNone(qq_qzone.command('别发说说'))
         with patch('qq_qzone.generate_requested_post', new_callable=AsyncMock,
                    return_value='想我老婆了。') as generate:
@@ -59,6 +59,21 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('发空间说说：正文', self.calls[-1][1]['message'])
         self.assertIn('没确认成功', self.calls[-1][1]['message'])
         self.model.ask_claude.assert_not_awaited()
+
+    async def test_capability_question_reports_actual_publish_path(self):
+        await self.connector.handle_event(None, self.event('你有没有实际调用QQ空间的权限'))
+        self.assertFalse(any(name == 'send_qzone_msg' for name, _ in self.calls))
+        self.assertIn('接了发空间说说的功能', self.calls[-1][1]['message'])
+        self.calls.clear()
+        self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
+        await self.connector.handle_event(None, self.event('你没有实际调用权限吗', mid=2))
+        self.assertIn('接了发空间说说的功能', self.calls[-1][1]['message'])
+
+    async def test_capability_reports_logged_out_account_truthfully(self):
+        self.connector.account_offline = True
+        await self.connector.handle_event(None, self.event('你有发空间说说的权限吗'))
+        self.assertIn('QQ 号现在离线', self.calls[-1][1]['message'])
+        self.assertFalse(any(name == 'send_qzone_msg' for name, _ in self.calls))
 
     async def test_contextual_self_post_request_dispatches_actual_api(self):
         self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
