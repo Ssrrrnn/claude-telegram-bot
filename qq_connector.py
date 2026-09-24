@@ -165,6 +165,31 @@ class QQConnector:
             "user_id": int(sender), "message": [{"type": "mface", "data": sticker}],
         })
 
+    async def _send_sticker(self, ws, sender, sticker):
+        if sticker.get("kind") != "image":
+            return await self._send_market_sticker(ws, sender, sticker)
+        file = sticker["file"]
+        # NapCat's filename cache is local and expires. Reading the original
+        # message restores its media reference after a restart when possible.
+        try:
+            original = await asyncio.wait_for(
+                self.action(ws, "get_msg", {"message_id": sticker["message_id"]}), timeout=5)
+            if isinstance(original, dict):
+                for segment in original.get("message", []):
+                    if isinstance(segment, dict) and segment.get("type") == "image":
+                        candidate = qq_stickers.normalize({"kind": "image", "file":
+                            (segment.get("data") or {}).get("file"), "message_id": sticker["message_id"]})
+                        if candidate and candidate["file"] == file:
+                            file = candidate["file"]
+                            break
+        except Exception:
+            pass
+        await self.action(ws, "send_private_msg", {
+            "user_id": int(sender), "message": [{"type": "image", "data": {
+                "file": file, "sub_type": sticker["sub_type"],
+            }}],
+        })
+
     async def _remember_stickers(self, event):
         raw = self.memory.get_setting(self.owner_chat_id, qq_stickers.SETTING_KEY)
         stickers, changed = qq_stickers.remember(raw, event)
@@ -172,6 +197,31 @@ class QQConnector:
             self.memory.set_setting(self.owner_chat_id, qq_stickers.SETTING_KEY,
                                     json.dumps(stickers, ensure_ascii=False))
         return stickers
+
+    async def _recover_owner_stickers(self, ws, sender, stickers):
+        """Recover recent images already sent by the paired owner, on demand."""
+        try:
+            history = await self.action(ws, "get_friend_msg_history", {
+                "user_id": str(sender), "message_seq": "0", "count": 50,
+            })
+            messages = history.get("messages", []) if isinstance(history, dict) else []
+            if not isinstance(messages, list):
+                return stickers
+            raw = json.dumps(stickers, ensure_ascii=False)
+            changed = False
+            for event in messages:
+                if not isinstance(event, dict) or str(event.get("user_id")) != str(sender):
+                    continue
+                stickers, added = qq_stickers.remember(raw, event)
+                if added:
+                    raw = json.dumps(stickers, ensure_ascii=False)
+                    changed = True
+            if changed:
+                self.memory.set_setting(self.owner_chat_id, qq_stickers.SETTING_KEY, raw)
+            return stickers
+        except Exception as exc:
+            print(f"QQ sticker history unavailable: {type(exc).__name__}", flush=True)
+            return stickers
 
     async def _maybe_send_sticker(self, ws, sender, user_text, replies, stickers, *, incoming_sticker=False):
         requested = qq_stickers.explicit_request(user_text)
@@ -194,13 +244,17 @@ class QQConnector:
             candidates = qq_stickers.fitting_stickers(stickers, answer)
         if not candidates:
             return False
-        try:
-            await self._send_market_sticker(ws, sender, random.choice(candidates))
-            self.memory.set_setting(self.owner_chat_id, qq_stickers.LAST_SENT_KEY, str(time.time()))
-            return True
-        except Exception as exc:
-            print(f"QQ sticker delivery skipped: {type(exc).__name__}", flush=True)
-            return False
+        choices = random.sample(candidates, len(candidates)) if requested else [random.choice(candidates)]
+        if requested:
+            choices.sort(key=lambda item: item.get("kind") == "image" and item.get("sub_type") == 0)
+        for sticker in choices[:3]:
+            try:
+                await self._send_sticker(ws, sender, sticker)
+                self.memory.set_setting(self.owner_chat_id, qq_stickers.LAST_SENT_KEY, str(time.time()))
+                return True
+            except Exception as exc:
+                print(f"QQ sticker delivery skipped: {type(exc).__name__}", flush=True)
+        return False
 
     async def _send_replies(self, ws, sender, replies):
         for reply in replies:
@@ -291,13 +345,15 @@ class QQConnector:
         except Exception as exc:
             print(f"QQ sticker library skipped: {type(exc).__name__}", flush=True)
             stickers = []
+        if qq_stickers.explicit_request(text) and not stickers:
+            stickers = await self._recover_owner_stickers(ws, sender, stickers)
         image_base64 = image_mime = None
         if images:
             try:
                 image_base64, image_mime = await self._image_content(ws, images[0])
             except Exception as exc:
                 print(f"QQ image unavailable: {type(exc).__name__}", flush=True)
-                await self._send_text(ws, sender, "这张图我暂时没看清，再发一次给我好吗？")
+                await self._send_text(ws, sender, "这张图我收到了，但现在没加载出来，暂时看不清内容。")
                 return
             if len(images) > 1:
                 text += f"（这条消息还有{len(images) - 1}张图未能查看，只针对第一张回应。）"
