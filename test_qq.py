@@ -1,10 +1,12 @@
 import unittest
 import time
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 from qq_connector import QQConnector, _message_parts, _qq_image_url, last_chat_platform
 from qq_gateway import QQGateway
 import qq_stickers
+import qq_status
 
 
 class FakeMemory:
@@ -34,6 +36,47 @@ class FakeMemory:
 
 
 class QQTests(unittest.IsolatedAsyncioTestCase):
+    def test_qq_status_uses_beijing_time_and_actual_chat_activity(self):
+        late = datetime(2026, 9, 24, 1, 0, tzinfo=qq_status.BEIJING).timestamp()
+        daytime = datetime(2026, 9, 24, 14, 0, tzinfo=qq_status.BEIJING).timestamp()
+        self.assertEqual(qq_status.choose(late)[1], "恋爱中")
+        self.assertEqual(qq_status.choose(late, last_user_at=late - 10 * 60)[1], "熬夜中")
+        self.assertEqual(qq_status.choose(late, last_user_at=late - 2 * 3600)[1], "恋爱中")
+        self.assertEqual(qq_status.choose(daytime, last_user_at=daytime)[1], "恋爱中")
+        self.assertEqual(qq_status.choose(late, last_user_at=late, love_until=late + 60)[1], "爱你")
+        self.assertTrue(qq_status.affectionate("只喜欢你"))
+        self.assertFalse(qq_status.affectionate("我不爱你"))
+
+    async def test_qq_status_changes_only_when_needed_and_can_be_disabled(self):
+        memory = FakeMemory()
+        memory.set_setting(42, "qq_owner_uin_v1", "12345678")
+        connector = QQConnector(owner_chat_id=42, pair_code="secret-pairing-code-123",
+                                expected_self_uin="88888888", handler=None, bot=object(), memory=memory)
+        ws = object()
+        connector.ws = ws
+        sent = []
+
+        async def action(ws, name, params):
+            sent.append((name, params))
+            return {}
+
+        connector.action = action
+        daytime = datetime(2026, 9, 24, 14, 0, tzinfo=qq_status.BEIJING).timestamp()
+        with patch("qq_connector.time.time", return_value=daytime):
+            await connector._refresh_status(ws)
+            await connector._refresh_status(ws)
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0], ("set_online_status", {
+                "status": 10, "ext_status": 1051, "battery_status": 0,
+            }))
+            connector.love_until = daytime + qq_status.LOVE_SECONDS
+            await connector._refresh_status(ws, urgent=True)
+            self.assertEqual(sent[-1][1]["ext_status"], 2006)
+        with patch.dict("os.environ", {"QQ_AUTO_STATUS": "off"}):
+            connector.last_status = None
+            await connector._refresh_status(ws)
+            self.assertEqual(len(sent), 2)
+
     async def test_spontaneous_sticker_needs_matching_tone_and_cooldown(self):
         memory = FakeMemory()
         connector = QQConnector(owner_chat_id=42, pair_code="secret-pairing-code-123",
