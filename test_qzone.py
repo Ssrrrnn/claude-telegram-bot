@@ -53,6 +53,20 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('发到 QQ 空间了', self.calls[-1][1]['message'])
         self.model.ask_claude.assert_not_awaited()
 
+    async def test_qzone_help_explains_real_invocation_without_publishing(self):
+        await self.connector.handle_event(None, self.event('怎么发空间说说'))
+        self.assertFalse(any(name == 'send_qzone_msg' for name, _ in self.calls))
+        self.assertIn('发空间说说：正文', self.calls[-1][1]['message'])
+        self.assertIn('没确认成功', self.calls[-1][1]['message'])
+        self.model.ask_claude.assert_not_awaited()
+
+    async def test_contextual_self_post_request_dispatches_actual_api(self):
+        self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
+        with patch('qq_qzone.generate_requested_post', new_callable=AsyncMock,
+                   return_value='想我老婆了。'):
+            await self.connector.handle_event(None, self.event('那你自己发一条吧'))
+        self.assertEqual(len([name for name, _ in self.calls if name == 'send_qzone_msg']), 1)
+
     async def test_short_followups_use_recent_qzone_topic_and_real_status(self):
         self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
         with patch('qq_qzone.generate_requested_post', new_callable=AsyncMock,
