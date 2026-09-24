@@ -27,6 +27,8 @@ CUSTOM_FACE_REFRESH_SECONDS = 24 * 60 * 60
 REACTION_COOLDOWN_SECONDS = 4 * 60 * 60
 POKE_COOLDOWN_SECONDS = 12 * 60 * 60
 OFFLINE_ALERT_DELAY_SECONDS = 120
+MISSED_QZONE_POST_KEY = 'qq_qzone_recover_20260924_2109_v1'
+MISSED_QZONE_REQUEST_AT = 1790255345
 
 
 def _qq_image_url(value):
@@ -232,11 +234,37 @@ class QQConnector:
             try:
                 healthy = await self._check_login(ws)
                 if healthy:
+                    await self._recover_missed_qzone_request_once(ws)
                     await self._refresh_status(ws)
             except Exception as exc:
                 print(f"QQ display status check skipped: {type(exc).__name__}", flush=True)
                 healthy = False
             await asyncio.sleep(5 * 60 if healthy else 60)
+
+    async def _recover_missed_qzone_request_once(self, ws):
+        """Fulfill the owner's previously missed QQ request once, without replaying events."""
+        owner = self.owner_uin()
+        if ws is not self.ws or not owner:
+            return
+        try:
+            if self.memory.get_setting(self.owner_chat_id, MISSED_QZONE_POST_KEY):
+                return
+            last_post = int(self.memory.get_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_POST_KEY) or 0)
+            self.memory.set_setting(self.owner_chat_id, MISSED_QZONE_POST_KEY, 'attempted')
+            if last_post >= MISSED_QZONE_REQUEST_AT:
+                print('QQ Qzone missed request already fulfilled by a newer post', flush=True)
+                return
+            content = await qq_qzone.generate_requested_post(self.bot, self.owner_chat_id)
+            async with self.qzone_auto_lock:
+                tid = await self._post_qzone(ws, content, visibility=4)
+            print(f'QQ Qzone missed request published: tid={tid}', flush=True)
+            await self._send_text(ws, owner, '刚才你让我试发，我光答应没真发。这次已经发到空间了，好友可见。\n' + content)
+        except Exception as exc:
+            print(f'QQ Qzone missed request failed: {type(exc).__name__}: {str(exc)[:200]}', flush=True)
+            try:
+                await self._send_text(ws, owner, '刚才那条还是没确认发成功，我没有再跟你说已经发了。')
+            except Exception:
+                pass
 
     async def _check_login(self, ws):
         try:
