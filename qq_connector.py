@@ -238,7 +238,7 @@ class QQConnector:
                     return False
             except (TypeError, ValueError):
                 pass
-            if random.random() >= 0.12:
+            if random.random() >= 0.25:
                 return False
             answer = " ".join(reply.get("text", "") for reply in replies if reply.get("type") == "text")
             candidates = qq_stickers.fitting_stickers(stickers, answer)
