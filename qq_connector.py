@@ -322,13 +322,14 @@ class QQConnector:
             with self.memory._connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT user_text FROM recent_conversation "
+                        "SELECT user_text, assistant_text FROM recent_conversation "
                         "WHERE chat_id = %s AND telegram_message_id < 0 "
                         "AND created_at > NOW() - INTERVAL '4 hours' "
                         "ORDER BY id DESC LIMIT 24",
                         (self.owner_chat_id,),
                     )
-                    return any(qq_qzone.topic_mentioned(row.get('user_text') or '')
+                    return any(qq_qzone.topic_mentioned(row.get('user_text') or '') or
+                               qq_qzone.topic_mentioned(row.get('assistant_text') or '')
                                for row in cur.fetchall())
         except Exception as exc:
             print(f'QQ Qzone topic lookup skipped: {type(exc).__name__}', flush=True)

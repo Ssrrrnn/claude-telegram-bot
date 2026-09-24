@@ -71,6 +71,10 @@ def topic_mentioned(text):
 def contextual_command(text):
     """Handle short follow-ups only when the conversation is about QQ Space."""
     value = text.strip(' 。！!？?，,')
+    # After a QQ Space discussion, a short "try it" asks for the actual post.
+    # The connector only uses this match when a recent QQ Space topic exists.
+    if re.fullmatch(r'(?:你|老公)?(?:现在|再|先)?试(?:一|两)?下(?:喽|吧|嘛|呀|啊)?(?:宝宝|老公|亲爱的)?', value):
+        return 'immediate', ''
     if re.fullmatch(r'(?:你|老公)?(?:到底)?(?:有|没有|有没有|有无)(?:实际)?(?:调用|发帖|发表)?权限(?:吗|呢|啊)?', value) or re.fullmatch(
         r'(?:你|老公)?(?:到底)?(?:能|可以|会)(?:实际)?(?:调用|发表|发)(?:吗|呢|啊)?', value,
     ):
