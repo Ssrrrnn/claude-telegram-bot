@@ -160,6 +160,23 @@ class QQTests(unittest.IsolatedAsyncioTestCase):
                 {"type": "image", "data": {"file": name}}]})
             self.assertEqual((stickers, changed), ([], False))
 
+    async def test_custom_qq_expressions_can_be_sent_later_but_photos_cannot(self):
+        memory = FakeMemory()
+        connector = QQConnector(owner_chat_id=42, pair_code="secret-pairing-code-123",
+                                expected_self_uin="88888888", handler=None, bot=object(), memory=memory)
+        connector._send_sticker = AsyncMock()
+        stickers = [
+            {"kind": "image", "file": "photo.jpg", "message_id": 1, "summary": "[图片]", "sub_type": 0},
+            {"kind": "image", "file": "expression.gif", "message_id": 2, "summary": "[图片表情]", "sub_type": 1},
+        ]
+        with patch("qq_connector.random.random", return_value=0):
+            self.assertFalse(await connector._maybe_send_sticker(None, "12345678", "抱抱", [
+                {"type": "text", "text": "抱一下。"}], stickers, incoming_sticker=True))
+            self.assertTrue(await connector._maybe_send_sticker(None, "12345678", "好", [
+                {"type": "text", "text": "抱一下。"}], stickers))
+        self.assertEqual(connector._send_sticker.await_args.args[-1]["file"], "expression.gif")
+        self.assertEqual(qq_stickers.fitting_stickers(stickers, "明天见。"), [])
+
     def test_qq_sticker_segments_are_not_dropped(self):
         event = {"message": [
             {"type": "text", "data": {"text": "给你"}},
