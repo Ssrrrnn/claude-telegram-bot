@@ -428,12 +428,14 @@ async def _proactive_tick(application):
         platform = read(qq_connector.PLATFORM_KEY) or "telegram"
         if platform == "qq":
             connector = application.bot_data.get("qq_connector")
-            if connector is None:
-                raise RuntimeError("QQ proactive connector unavailable")
-            sent_as_voice = await connector.send_proactive(
-                text, strict_split_bubbles(text), as_voice=send_as_voice,
-            )
-        else:
+            if connector is None or connector.ws is None:
+                print(f"QQ proactive unavailable: chat_id={chat_id}, falling back to Telegram", flush=True)
+                platform = "telegram"
+            else:
+                sent_as_voice = await connector.send_proactive(
+                    text, strict_split_bubbles(text), as_voice=send_as_voice,
+                )
+        if platform != "qq":
             sent_as_voice = send_as_voice and await voice_output.send_voice(
                 application.bot, chat_id, text, get_setting=runner.memory_pg.get_setting)
             if not sent_as_voice:
