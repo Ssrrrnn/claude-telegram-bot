@@ -303,7 +303,16 @@ def _first_morning_contact(chat_id):
     if not 8 <= now_local.hour < 12:
         return False
     last_sent = _get_int_setting(chat_id, KEY_LAST_PROACTIVE_AT)
-    return not last_sent or datetime.fromtimestamp(last_sent, PROACTIVE_TZ).date() < now_local.date()
+    last_user = _get_int_setting(chat_id, KEY_LAST_USER_AT)
+    morning_start = now_local.replace(hour=8, minute=30, second=0, microsecond=0).timestamp()
+    return (last_user < morning_start and
+            (not last_sent or datetime.fromtimestamp(last_sent, PROACTIVE_TZ).date() < now_local.date()))
+
+
+def _morning_is_due(chat_id):
+    now_local = _now_local()
+    return (8 * 60 + 45 <= now_local.hour * 60 + now_local.minute < 10 * 60 + 30
+            and _first_morning_contact(chat_id))
 
 
 def _morning_message(previous):
@@ -317,7 +326,7 @@ def _morning_message(previous):
     return ""
 
 
-async def _generate_proactive_message(chat_id, state, *, morning_first=False):
+async def _generate_proactive_message(chat_id, state, *, morning_first=False, dates=None):
     context_state = continuity.load(runner.memory_pg, chat_id)
     followup = continuity.due_followup(context_state, time.time())
     if not runner.bot.histories[chat_id] and hasattr(runner.memory_pg, "load_recent_messages"):
@@ -327,6 +336,8 @@ async def _generate_proactive_message(chat_id, state, *, morning_first=False):
     kind = policy.choose_type(_now_local(), [x["type"] for x in sent], state["silence_count"])
     if followup:
         kind = "回访:" + followup["id"]
+    if dates:
+        kind = "重要日子"
     trigger = (
         "【后台主动联系事件，不是用户发送的消息】\n"
         "以当前角色本人主动联系，不提后台、提醒、定时或这段指令。保持既有人格。"
@@ -347,6 +358,10 @@ async def _generate_proactive_message(chat_id, state, *, morning_first=False):
         trigger += "\n只自然接起这件事，不编造进展。你并没有替用户完成任务。"
     if morning_first:
         trigger += "\n这是安静时段结束后的第一条主动联系。用户未说晚安暂停时，写一句轻的早安或想念；不假定用户已经醒了，不要求立刻回复。"
+    if dates:
+        trigger += "\n用户亲自登记的今天的日子：" + json.dumps(
+            [x["name"] for x in dates], ensure_ascii=False)
+        trigger += "。自然提起并表达在意，不编造共同经历；不说提醒、数据库或系统。"
     previous = [x["content"] for x in sent]
     for attempt in range(3):
         instruction = trigger
@@ -357,13 +372,15 @@ async def _generate_proactive_message(chat_id, state, *, morning_first=False):
             runner.bot.current_model(chat_id),
         )
         if text and text.strip().strip('`').strip() == "NO_REPLY":
-            if morning_first:
+            if morning_first or dates:
                 continue
             return "", kind
         if text and not policy.is_repetition(text, previous):
             return text.strip(), kind
         if text:
             previous.append(text)
+    if dates:
+        return "今天是你告诉过我的「" + dates[0]["name"] + "」。我记着。", kind
     return (_morning_message(previous) if morning_first else ""), kind
 
 
@@ -376,11 +393,17 @@ async def _proactive_tick(application):
     if read(KEY_ENABLED) == "0":
         return
     now = time.time()
+    now_local = _now_local()
+    import milestones
+    important_dates = (milestones.due(read(milestones.KEY), now_local.date())
+                       if now_local.hour >= 9 and read(milestones.LAST_SENT_KEY) != now_local.date().isoformat()
+                       else [])
+    morning_due = _morning_is_due(chat_id)
     next_at = int(read(KEY_NEXT_AT) or 0)
     if not next_at:
         _schedule_from_now(chat_id)
         return
-    if now < next_at:
+    if now < next_at and not important_dates and not morning_due:
         # A newly extracted follow-up may become due before the older random
         # check. Honor its reason while retaining the 20-minute contact floor.
         pending = continuity.due_followup(continuity.load(runner.memory_pg, chat_id), now)
@@ -398,12 +421,14 @@ async def _proactive_tick(application):
     # Serialize with normal replies; incoming text is recorded before generation.
     async with runner.bot.chat_locks[chat_id]:
         last_user_at = int(read(KEY_LAST_USER_AT) or 0)
-        if chat_id in _active_time_context or now - last_user_at < PROACTIVE_MIN_SECONDS:
+        last_bot_at = int(read(KEY_LAST_PROACTIVE_AT) or 0)
+        if (chat_id in _active_time_context or
+                now - max(last_user_at, last_bot_at) < PROACTIVE_MIN_SECONDS):
             _schedule_from_now(chat_id)
             return
         state = _load_state(chat_id)
         text, kind = await _generate_proactive_message(
-            chat_id, state, morning_first=_first_morning_contact(chat_id))
+            chat_id, state, morning_first=_first_morning_contact(chat_id), dates=important_dates)
         # A message may arrive while the model is thinking.
         if (chat_id in _active_time_context or int(read(KEY_LAST_USER_AT) or 0) != last_user_at
                 or _is_quiet_time() or read(KEY_ENABLED) == "0"):
@@ -418,6 +443,9 @@ async def _proactive_tick(application):
         # Persist a cooldown BEFORE delivery. If Telegram times out after accepting
         # a bubble, do not immediately retry the same message on the next tick.
         _schedule_from_now(chat_id)
+        if important_dates:
+            # Claim the date before a network send to prevent duplicate greetings on timeout.
+            runner.memory_pg.set_setting(chat_id, milestones.LAST_SENT_KEY, now_local.date().isoformat())
         if kind.startswith("回访:") and not continuity.claim_followup(runner.memory_pg, chat_id, kind.split(":", 1)[1]):
             return
         voice_mode = voice_output.mode(runner.memory_pg.get_setting, chat_id)
