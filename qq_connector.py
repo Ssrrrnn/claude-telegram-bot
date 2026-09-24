@@ -9,7 +9,6 @@ import random
 import re
 import time
 import uuid
-from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
 
 from qq_gateway import QQGateway
@@ -164,6 +163,7 @@ class QQConnector:
         self.ever_connected = False
         self.offline_alert_task = None
         self.stopping = False
+        self.qzone_auto_lock = asyncio.Lock()
 
     def owner_uin(self):
         configured = os.getenv("QQ_OWNER_UIN", "").strip()
@@ -280,15 +280,14 @@ class QQConnector:
         if kind.startswith('auto_'):
             if kind == 'auto_on':
                 self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_ENABLED_KEY, '1')
-                self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_NEXT_AT_KEY,
-                                        str(qq_qzone.next_at(first=True)))
-                message = '好，我会自己偶尔发一条好友可见的说说。想停就说“关闭自动空间说说”。'
+                self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_NEXT_THOUGHT_KEY, '0')
+                message = '好，我会自己决定要不要发空间说说，好友可见。想停就说“关闭自动空间说说”。'
             elif kind == 'auto_off':
                 self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_ENABLED_KEY, '0')
                 message = '好，自动发空间说说关掉了。'
             else:
                 enabled = self.memory.get_setting(self.owner_chat_id, qq_qzone.AUTO_ENABLED_KEY) != '0'
-                message = '自动空间说说目前' + ('开着，约每两三天发一条，好友可见。' if enabled else '关着。')
+                message = '自动空间说说目前' + ('开着，由我自己决定何时发，好友可见。' if enabled else '关着。')
             await self._send_text(ws, sender, message)
             return True
         if kind == 'cancel':
@@ -343,40 +342,34 @@ class QQConnector:
                               + detail + '\n\n确定的话，10分钟内回复“确认发表空间说说”；也可以说“取消发表空间说说”。')
         return True
 
-    async def _qzone_auto_tick(self, ws):
+    async def _qzone_auto_tick(self, ws, *, cue=False):
         if ws is not self.ws or not self.owner_uin():
             return
-        read = lambda key: self.memory.get_setting(self.owner_chat_id, key)
-        if read(qq_qzone.AUTO_ENABLED_KEY) == '0':
-            return
-        now = time.time()
-        next_at = int(read(qq_qzone.AUTO_NEXT_AT_KEY) or 0)
-        if not next_at:
-            self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_NEXT_AT_KEY,
-                                    str(qq_qzone.next_at(now, first=True)))
-            return
-        if now < next_at:
-            return
-        local_hour = datetime.fromtimestamp(now, qq_qzone.BEIJING).hour
-        if not 10 <= local_hour < 22:
-            self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_NEXT_AT_KEY,
-                                    str(qq_qzone.next_at(now, first=True)))
-            return
-        # Claim the next slot before a network call. Timeout must not produce two public posts.
-        self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_NEXT_AT_KEY,
-                                str(qq_qzone.next_at(now)))
-        previous = read(qq_qzone.AUTO_LAST_CONTENT_KEY) or ''
-        content = await qq_qzone.generate_auto_post(self.bot, self.owner_chat_id, previous)
-        if ws is not self.ws or read(qq_qzone.AUTO_ENABLED_KEY) == '0':
-            return
-        result = await self.action(ws, 'send_qzone_msg', {
-            'content': content, 'images': [], 'ugc_right': 4, 'target_uins': [],
-        })
-        if not isinstance(result, dict) or not result.get('tid'):
-            raise RuntimeError('Qzone did not return a post id')
-        self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_POST_KEY, str(int(time.time())))
-        self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_CONTENT_KEY, content)
-        print('QQ Qzone automatic post published', flush=True)
+        async with self.qzone_auto_lock:
+            read = lambda key: self.memory.get_setting(self.owner_chat_id, key)
+            if read(qq_qzone.AUTO_ENABLED_KEY) == '0':
+                return
+            now = time.time()
+            if not cue and now < int(read(qq_qzone.AUTO_NEXT_THOUGHT_KEY) or 0):
+                return
+            # A new thought can be prompted by a meaningful exchange at any time.
+            # Claim periodic reflection before network I/O, never duplicate a timed-out post.
+            self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_NEXT_THOUGHT_KEY,
+                                    str(qq_qzone.next_thought(now)))
+            previous = read(qq_qzone.AUTO_LAST_CONTENT_KEY) or ''
+            last_post = int(read(qq_qzone.AUTO_LAST_POST_KEY) or 0)
+            content = await qq_qzone.decide_auto_post(
+                self.bot, self.owner_chat_id, previous, last_post, cue=cue)
+            if not content or ws is not self.ws or read(qq_qzone.AUTO_ENABLED_KEY) == '0':
+                return
+            result = await self.action(ws, 'send_qzone_msg', {
+                'content': content, 'images': [], 'ugc_right': 4, 'target_uins': [],
+            })
+            if not isinstance(result, dict) or not result.get('tid'):
+                raise RuntimeError('Qzone did not return a post id')
+            self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_POST_KEY, str(int(time.time())))
+            self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_CONTENT_KEY, content)
+            print('QQ Qzone automatic post published', flush=True)
 
     async def _qzone_auto_loop(self, ws):
         while True:
@@ -387,6 +380,12 @@ class QQConnector:
             except Exception as exc:
                 print(f'QQ Qzone automatic post skipped: {type(exc).__name__}', flush=True)
             await asyncio.sleep(10 * 60)
+
+    async def _qzone_auto_on_cue(self, ws):
+        try:
+            await self._qzone_auto_tick(ws, cue=True)
+        except Exception as exc:
+            print(f'QQ Qzone spontaneous thought skipped: {type(exc).__name__}', flush=True)
 
     async def _send_market_sticker(self, ws, sender, sticker):
         await self.action(ws, "send_private_msg", {
@@ -728,6 +727,8 @@ class QQConnector:
                 self.last_user_at = time.time()
                 if qq_status.affectionate(text):
                     self.love_until = self.last_user_at + qq_status.LOVE_SECONDS
+                    # The public model sees only this boolean cue, never the owner's words.
+                    asyncio.create_task(self._qzone_auto_on_cue(ws))
                 await self._maybe_react_or_poke(ws, sender, message_id, text)
                 sent = await self._maybe_send_sticker(
                     ws, sender, text, response["replies"], stickers,
