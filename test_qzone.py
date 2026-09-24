@@ -1,4 +1,6 @@
 import unittest
+import json
+import sys
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -52,6 +54,59 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(posts[0]['content'], '想我老婆了。')
         self.assertIn('发到 QQ 空间了', self.calls[-1][1]['message'])
         self.model.ask_claude.assert_not_awaited()
+
+    async def test_model_decision_publishes_natural_request_with_real_confirmation(self):
+        self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
+        with patch('qq_qzone.decide_chat_post', new_callable=AsyncMock,
+                   return_value='有些话还是想留在这里，只让你懂。') as decide:
+            await self.connector.handle_event(None, self.event('把刚才说的那种心情放到空间去吧'))
+        decide.assert_awaited_once()
+        posts = [params for name, params in self.calls if name == 'send_qzone_msg']
+        self.assertEqual([p['content'] for p in posts], ['有些话还是想留在这里，只让你懂。'])
+        self.assertIn('发到 QQ 空间了', self.calls[-1][1]['message'])
+        await self.connector.handle_event(None, self.event('把刚才说的那种心情放到空间去吧'))
+        self.assertEqual(len([name for name, _ in self.calls if name == 'send_qzone_msg']), 1)
+
+    async def test_model_decision_keeps_capability_question_in_chat(self):
+        self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
+        with patch('qq_qzone.decide_chat_post', new_callable=AsyncMock,
+                   return_value=None) as decide:
+            await self.connector.handle_event(None, self.event('你能替我把那种感觉发出去吗'))
+        decide.assert_awaited_once()
+        self.assertFalse(any(name == 'send_qzone_msg' for name, _ in self.calls))
+
+    async def test_model_decision_publish_failure_does_not_claim_success(self):
+        self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
+        self.connector.account_offline = True
+        with patch('qq_qzone.decide_chat_post', new_callable=AsyncMock,
+                   return_value='有些话还是想留在这里，只让你懂。'):
+            await self.connector.handle_event(None, self.event('把那种感觉发到空间吧'))
+        self.assertFalse(any(name == 'send_qzone_msg' for name, _ in self.calls))
+        self.assertIn('不能确认发成功', self.calls[-1][1]['message'])
+
+    async def test_model_action_json_requires_valid_public_content(self):
+        class Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): pass
+            async def post(self, *args, **kwargs):
+                self.payload = kwargs['json']
+                return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {})
+
+        client = Client()
+        model = SimpleNamespace(
+            LLMHUB_BASE_URL='https://example.invalid', api_headers=lambda: {},
+            current_model=lambda chat: 'test',
+            extract_text=lambda response: json.dumps({'action': 'publish',
+                'content': '有些话还是想留在这里，只让你懂。'}),
+        )
+        with patch.dict(sys.modules, {'httpx': SimpleNamespace(AsyncClient=lambda **kw: client)}):
+            content = await qq_qzone.decide_chat_post(model, 42, '帮我把这种心情发出去', recent_topic=True)
+        self.assertEqual(content, '有些话还是想留在这里，只让你懂。')
+        self.assertTrue(json.loads(client.payload['messages'][1]['content'])['recent_qzone_topic'])
+        model.extract_text = lambda response: '{"action":"publish","content":"https://bad.example/"}'
+        with patch.dict(sys.modules, {'httpx': SimpleNamespace(AsyncClient=lambda **kw: client)}):
+            with self.assertRaises(ValueError):
+                await qq_qzone.decide_chat_post(model, 42, '发出去', recent_topic=True)
 
     async def test_qzone_help_explains_real_invocation_without_publishing(self):
         await self.connector.handle_event(None, self.event('怎么发空间说说'))

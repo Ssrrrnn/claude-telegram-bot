@@ -774,11 +774,35 @@ class QQConnector:
                 self.memory.set_setting(self.owner_chat_id, qq_qzone.LAST_TOPIC_AT_KEY, str(int(time.time())))
             except Exception as exc:
                 print(f'QQ Qzone topic state unavailable: {type(exc).__name__}', flush=True)
+        qzone_context = self._qzone_context_active()
         parsed = qq_qzone.command(text)
-        if not parsed and qq_qzone.contextual_command(text) and self._qzone_context_active():
+        if not parsed and qq_qzone.contextual_command(text) and qzone_context:
             parsed = qq_qzone.contextual_command(text)
         if parsed and await self._handle_qzone_command(ws, sender, message_id, text, parsed=parsed):
             return
+        # Natural language that the fixed command parser misses still reaches
+        # a model decision. A publish is executed here, before any chat reply.
+        # Never report success until OneBot returns a post id.
+        if qzone_context:
+            try:
+                content = await qq_qzone.decide_chat_post(
+                    self.bot, self.owner_chat_id, text, recent_topic=qzone_context)
+            except Exception as exc:
+                print(f'QQ Qzone action decision skipped: {type(exc).__name__}', flush=True)
+                content = None
+            if content:
+                if self.memory.get_setting(self.owner_chat_id, qq_qzone.LAST_REQUEST_KEY) == str(message_id):
+                    await self._send_text(ws, sender, '这条发帖请求已经处理过了，去空间看一下结果。')
+                    return
+                self.memory.set_setting(self.owner_chat_id, qq_qzone.LAST_REQUEST_KEY, str(message_id))
+                try:
+                    async with self.qzone_auto_lock:
+                        await self._post_qzone(ws, content, visibility=4)
+                    await self._send_text(ws, sender, '发到 QQ 空间了，好友可见。\n' + content)
+                except Exception as exc:
+                    print(f'QQ Qzone model action uncertain: {type(exc).__name__}', flush=True)
+                    await self._send_text(ws, sender, '这条还不能确认发成功。先去空间看一眼，别重复发同一句。')
+                return
         quoted_context = await self._quoted_context(ws, event, sender)
         game = _requested_game(text)
         music_card = qq_music.card(text)
