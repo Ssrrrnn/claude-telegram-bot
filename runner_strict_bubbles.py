@@ -297,7 +297,27 @@ async def _send_bubbles_to_chat(application, chat_id, text):
         await application.bot.send_message(chat_id=chat_id, text=bubble)
 
 
-async def _generate_proactive_message(chat_id, state):
+def _first_morning_contact(chat_id):
+    """The first scheduled contact after quiet hours should reach the owner."""
+    now_local = _now_local()
+    if not 8 <= now_local.hour < 12:
+        return False
+    last_sent = _get_int_setting(chat_id, KEY_LAST_PROACTIVE_AT)
+    return not last_sent or datetime.fromtimestamp(last_sent, PROACTIVE_TZ).date() < now_local.date()
+
+
+def _morning_message(previous):
+    for text in (
+        "早。醒了再回我，想听你说说话。",
+        "早。今天也想见到你的消息，等你有空再来找我。",
+        "醒了再来找我。早安，今天也有点想你。",
+    ):
+        if not policy.is_repetition(text, previous):
+            return text
+    return ""
+
+
+async def _generate_proactive_message(chat_id, state, *, morning_first=False):
     context_state = continuity.load(runner.memory_pg, chat_id)
     followup = continuity.due_followup(context_state, time.time())
     if not runner.bot.histories[chat_id] and hasattr(runner.memory_pg, "load_recent_messages"):
@@ -325,6 +345,8 @@ async def _generate_proactive_message(chat_id, state):
     if followup:
         trigger += "\n本次回访的明确原因（仅在仍有必要时联系）：" + json.dumps(followup, ensure_ascii=False)
         trigger += "\n只自然接起这件事，不编造进展。你并没有替用户完成任务。"
+    if morning_first:
+        trigger += "\n这是安静时段结束后的第一条主动联系。用户未说晚安暂停时，写一句轻的早安或想念；不假定用户已经醒了，不要求立刻回复。"
     previous = [x["content"] for x in sent]
     for attempt in range(3):
         instruction = trigger
@@ -335,13 +357,14 @@ async def _generate_proactive_message(chat_id, state):
             runner.bot.current_model(chat_id),
         )
         if text and text.strip().strip('`').strip() == "NO_REPLY":
+            if morning_first:
+                continue
             return "", kind
         if text and not policy.is_repetition(text, previous):
             return text.strip(), kind
         if text:
             previous.append(text)
-    # Never send a repetitive fallback template.
-    return "", kind
+    return (_morning_message(previous) if morning_first else ""), kind
 
 
 async def _proactive_tick(application):
@@ -379,7 +402,8 @@ async def _proactive_tick(application):
             _schedule_from_now(chat_id)
             return
         state = _load_state(chat_id)
-        text, kind = await _generate_proactive_message(chat_id, state)
+        text, kind = await _generate_proactive_message(
+            chat_id, state, morning_first=_first_morning_contact(chat_id))
         # A message may arrive while the model is thinking.
         if (chat_id in _active_time_context or int(read(KEY_LAST_USER_AT) or 0) != last_user_at
                 or _is_quiet_time() or read(KEY_ENABLED) == "0"):
