@@ -9,6 +9,7 @@ import random
 import re
 import time
 import uuid
+from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
 
 from qq_gateway import QQGateway
@@ -276,6 +277,20 @@ class QQConnector:
         if not parsed:
             return False
         kind, detail = parsed
+        if kind.startswith('auto_'):
+            if kind == 'auto_on':
+                self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_ENABLED_KEY, '1')
+                self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_NEXT_AT_KEY,
+                                        str(qq_qzone.next_at(first=True)))
+                message = '好，我会自己偶尔发一条好友可见的说说。想停就说“关闭自动空间说说”。'
+            elif kind == 'auto_off':
+                self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_ENABLED_KEY, '0')
+                message = '好，自动发空间说说关掉了。'
+            else:
+                enabled = self.memory.get_setting(self.owner_chat_id, qq_qzone.AUTO_ENABLED_KEY) != '0'
+                message = '自动空间说说目前' + ('开着，约每两三天发一条，好友可见。' if enabled else '关着。')
+            await self._send_text(ws, sender, message)
+            return True
         if kind == 'cancel':
             self.memory.set_setting(self.owner_chat_id, qq_qzone.PENDING_KEY, '')
             await self._send_text(ws, sender, '好，这条说说不发了。')
@@ -327,6 +342,51 @@ class QQConnector:
         await self._send_text(ws, sender, '这条准备发到 QQ 空间，公开可见：\n\n'
                               + detail + '\n\n确定的话，10分钟内回复“确认发表空间说说”；也可以说“取消发表空间说说”。')
         return True
+
+    async def _qzone_auto_tick(self, ws):
+        if ws is not self.ws or not self.owner_uin():
+            return
+        read = lambda key: self.memory.get_setting(self.owner_chat_id, key)
+        if read(qq_qzone.AUTO_ENABLED_KEY) == '0':
+            return
+        now = time.time()
+        next_at = int(read(qq_qzone.AUTO_NEXT_AT_KEY) or 0)
+        if not next_at:
+            self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_NEXT_AT_KEY,
+                                    str(qq_qzone.next_at(now, first=True)))
+            return
+        if now < next_at:
+            return
+        local_hour = datetime.fromtimestamp(now, qq_qzone.BEIJING).hour
+        if not 10 <= local_hour < 22:
+            self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_NEXT_AT_KEY,
+                                    str(qq_qzone.next_at(now, first=True)))
+            return
+        # Claim the next slot before a network call. Timeout must not produce two public posts.
+        self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_NEXT_AT_KEY,
+                                str(qq_qzone.next_at(now)))
+        previous = read(qq_qzone.AUTO_LAST_CONTENT_KEY) or ''
+        content = await qq_qzone.generate_auto_post(self.bot, self.owner_chat_id, previous)
+        if ws is not self.ws or read(qq_qzone.AUTO_ENABLED_KEY) == '0':
+            return
+        result = await self.action(ws, 'send_qzone_msg', {
+            'content': content, 'images': [], 'ugc_right': 4, 'target_uins': [],
+        })
+        if not isinstance(result, dict) or not result.get('tid'):
+            raise RuntimeError('Qzone did not return a post id')
+        self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_POST_KEY, str(int(time.time())))
+        self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_CONTENT_KEY, content)
+        print('QQ Qzone automatic post published', flush=True)
+
+    async def _qzone_auto_loop(self, ws):
+        while True:
+            try:
+                await self._qzone_auto_tick(ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f'QQ Qzone automatic post skipped: {type(exc).__name__}', flush=True)
+            await asyncio.sleep(10 * 60)
 
     async def _send_market_sticker(self, ws, sender, sticker):
         await self.action(ws, "send_private_msg", {
@@ -706,6 +766,7 @@ class QQConnector:
                     self.last_status_at = 0
                     print("QQ OneBot private connection ready", flush=True)
                     status_task = asyncio.create_task(self._status_loop(ws), name="qq-display-status")
+                    qzone_task = asyncio.create_task(self._qzone_auto_loop(ws), name='qq-qzone-auto')
                     try:
                         async for raw in ws:
                             try:
@@ -723,8 +784,13 @@ class QQConnector:
                                 print(f"QQ OneBot event skipped: {type(exc).__name__}", flush=True)
                     finally:
                         status_task.cancel()
+                        qzone_task.cancel()
                         try:
                             await status_task
+                        except asyncio.CancelledError:
+                            pass
+                        try:
+                            await qzone_task
                         except asyncio.CancelledError:
                             pass
             except asyncio.CancelledError:
