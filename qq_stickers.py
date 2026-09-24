@@ -5,7 +5,7 @@ import json
 SETTING_KEY = "qq_market_stickers_v1"
 LAST_SENT_KEY = "qq_market_sticker_last_sent_v1"
 MAX_STICKERS = 16
-SPONTANEOUS_COOLDOWN = 4 * 60 * 60
+SPONTANEOUS_COOLDOWN = 90 * 60
 
 
 def normalize(data):
@@ -110,4 +110,8 @@ def fitting_stickers(items, reply):
                        any(label in item["summary"] for label in labels)]
             if matched:
                 return matched
+            # PicSubType.KCUSTOM (1) is QQ's custom expression. Ordinary
+            # photos (0) must never be sent as unsolicited stickers.
+            return [item for item in items if item.get("kind") == "image" and
+                    item.get("sub_type") == 1]
     return []
