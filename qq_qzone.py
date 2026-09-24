@@ -65,7 +65,8 @@ def command(text):
 
 
 def topic_mentioned(text):
-    return bool(re.search(r'QQ空间|空间说说|(?:发|发表|写|看).{0,5}说说|说说.{0,6}(?:发|发表|看)', text))
+    return bool(re.search(r'QQ空间|空间说说|(?:发|发表|写|看).{0,5}说说|说说.{0,6}(?:发|发表|看)'
+                          r'|(?:发|发表|写|发布|放到|放进).{0,8}(?:空间|动态)', text))
 
 
 def contextual_command(text):
@@ -179,4 +180,54 @@ async def generate_requested_post(bot, chat_id, hint=''):
     if (not 10 <= len(content) <= MAX_POST_CHARS or content == 'NO_POST'
             or any(mark in content for mark in ('...', '……', '…', '<', '>', 'http://', 'https://', '\n'))):
         raise ValueError('Qzone requested post did not pass validation')
+    return content
+
+
+async def decide_chat_post(bot, chat_id, user_text, *, recent_topic=False):
+    """Let the QQ companion choose a real publish action for natural requests.
+
+    This decision is separate from the visible reply so a verbal promise can
+    never masquerade as a successful OneBot action.
+    """
+    import httpx
+
+    messages = [
+        {'role': 'system', 'content': (
+            '你是QQ私聊里的恋爱伴侣，拥有发表自己QQ空间说说的真实操作入口。'
+            '判断用户这句话是否明确要求你现在发表一条说说。'
+            '只有现在就要发表才选择publish；询问能力、讨论教程、否定、假设、'
+            '引用别人的话、要草稿、查发表状态、普通聊天一律选择none。'
+            '如果上一轮已在聊QQ空间，"试一下"、"就发那个"也可以是发表请求；'
+            '没有相关上下文时不得把这些短句当成发表请求。'
+            '只输出一个JSON对象：{"action":"none"}，或者'
+            '{"action":"publish","content":"最终公开正文"}。'
+            '需要自己写时，正文10到100字，像真人随手写的亲密心情。'
+            '用户指定了明确正文则照用，但不得泄露私聊原话、真实姓名、位置、'
+            '账号、工作或具体共同经历。不得编造现实见面和活动。'
+            '正文不含换行、链接、省略号、内部标签；不要说自己已经发出。')},
+        {'role': 'user', 'content': json.dumps({
+            'message': user_text[:4000], 'recent_qzone_topic': bool(recent_topic),
+        }, ensure_ascii=False)},
+    ]
+    async with httpx.AsyncClient(timeout=25) as client:
+        response = await client.post(
+            f'{bot.LLMHUB_BASE_URL}/chat/completions',
+            headers=bot.api_headers(),
+            json={'model': bot.current_model(chat_id), 'messages': messages, 'stream': False},
+        )
+    response.raise_for_status()
+    raw = bot.extract_text(response.json()).strip()
+    # Some providers wrap a JSON response in a Markdown fence.
+    if raw.startswith('```'):
+        raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw, flags=re.I).strip()
+    value = json.loads(raw)
+    if not isinstance(value, dict) or value.get('action') not in ('none', 'publish'):
+        raise ValueError('Invalid Qzone action decision')
+    if value['action'] == 'none':
+        return None
+    content = value.get('content')
+    if (not isinstance(content, str) or not 10 <= len(content) <= MAX_POST_CHARS
+            or any(mark in content for mark in ('...', '……', '…', '<', '>', 'http://',
+                                                'https://', '\n', '\r'))):
+        raise ValueError('Invalid Qzone action content')
     return content
