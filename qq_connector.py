@@ -16,6 +16,7 @@ from qq_face_names import FACE_NAMES
 import qq_stickers
 import qq_status
 import qq_music
+import qq_qzone
 
 OWNER_KEY = "qq_owner_uin_v1"
 PLATFORM_KEY = "last_active_platform_v1"
@@ -269,6 +270,63 @@ class QQConnector:
                 print(f'QQ quoted message unavailable: {type(exc).__name__}', flush=True)
                 return '用户引用了一条消息，但内容暂时无法读取'
         return None
+
+    async def _handle_qzone_command(self, ws, sender, message_id, text):
+        parsed = qq_qzone.command(text)
+        if not parsed:
+            return False
+        kind, detail = parsed
+        if kind == 'cancel':
+            self.memory.set_setting(self.owner_chat_id, qq_qzone.PENDING_KEY, '')
+            await self._send_text(ws, sender, '好，这条说说不发了。')
+            return True
+        if kind == 'confirm':
+            # Claim the exact QQ confirmation event before calling the remote API.
+            # A timeout can occur after publishing, so never retry that event.
+            if self.memory.get_setting(self.owner_chat_id, qq_qzone.LAST_CONFIRM_KEY) == str(message_id):
+                await self._send_text(ws, sender, '这条确认已经处理过了，去空间看一下结果。')
+                return True
+            content = qq_qzone.pending(self.memory.get_setting(self.owner_chat_id, qq_qzone.PENDING_KEY))
+            if not content:
+                await self._send_text(ws, sender, '草稿已经过期或还没写。发“发空间说说：正文”重新准备一条。')
+                return True
+            self.memory.set_setting(self.owner_chat_id, qq_qzone.LAST_CONFIRM_KEY, str(message_id))
+            self.memory.set_setting(self.owner_chat_id, qq_qzone.PENDING_KEY, '')
+            try:
+                result = await self.action(ws, 'send_qzone_msg', {
+                    'content': content, 'images': [], 'ugc_right': 1, 'target_uins': [],
+                })
+                if not isinstance(result, dict) or not result.get('tid'):
+                    raise RuntimeError('Qzone did not return a post id')
+                await self._send_text(ws, sender, '发到 QQ 空间了。')
+            except Exception as exc:
+                print(f'QQ Qzone post uncertain: {type(exc).__name__}', flush=True)
+                await self._send_text(ws, sender, '这次没确认是否发成功。先去空间看一眼，别立刻重复发表。')
+            return True
+        if len(detail) > (120 if kind == 'draft' else qq_qzone.MAX_POST_CHARS):
+            await self._send_text(ws, sender, '这段有点长。主题控制在120字内，正文控制在300字内，好吗？')
+            return True
+        if kind == 'draft':
+            try:
+                instruction = ('请以角色本人的口吻写一条准备发表在QQ空间的说说，主题是：'
+                               + detail + '\n只给最终正文，限150字。可以自然、亲密，'
+                               '不能透露私聊记录、真实姓名、住址或未经证实的共同经历。'
+                               '不要说自己已发表，也不要加标题或引号。')
+                detail = (await self.bot.ask_claude(
+                    self.owner_chat_id, [{'role': 'user', 'content': instruction}],
+                    self.bot.current_model(self.owner_chat_id),
+                ) or '').strip()
+            except Exception as exc:
+                print(f'QQ Qzone draft failed: {type(exc).__name__}', flush=True)
+                await self._send_text(ws, sender, '刚才没写出来，等会儿再试一次。')
+                return True
+        if not detail or len(detail) > qq_qzone.MAX_POST_CHARS:
+            await self._send_text(ws, sender, '草稿没写好，换个主题再试试。')
+            return True
+        self.memory.set_setting(self.owner_chat_id, qq_qzone.PENDING_KEY, qq_qzone.encode(detail))
+        await self._send_text(ws, sender, '这条准备发到 QQ 空间，公开可见：\n\n'
+                              + detail + '\n\n确定的话，10分钟内回复“确认发表空间说说”；也可以说“取消发表空间说说”。')
+        return True
 
     async def _send_market_sticker(self, ws, sender, sticker):
         await self.action(ws, "send_private_msg", {
@@ -540,6 +598,8 @@ class QQConnector:
                 print(f"QQ voice transcription unavailable: {type(exc).__name__}", flush=True)
                 await self._send_text(ws, sender, "刚才那段语音没听清，打字告诉我，好吗？")
                 return
+        if await self._handle_qzone_command(ws, sender, message_id, text):
+            return
         quoted_context = await self._quoted_context(ws, event, sender)
         game = _requested_game(text)
         music_card = qq_music.card(text)
