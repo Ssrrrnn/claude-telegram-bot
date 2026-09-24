@@ -154,6 +154,38 @@ class QQTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["file"] for item in qq_stickers.load(
             memory.get_setting(42, qq_stickers.SETTING_KEY))], ["owner.gif"])
 
+    async def test_market_sticker_is_discovered_even_with_saved_images(self):
+        memory = FakeMemory()
+        memory.set_setting(42, "qq_owner_uin_v1", "12345678")
+        initial = {"kind": "image", "file": "image.gif", "message_id": 2,
+                   "summary": "[图片表情]", "sub_type": 1}
+        memory.set_setting(42, qq_stickers.SETTING_KEY, __import__('json').dumps([initial]))
+
+        async def handler(update, context): await update.message.reply_text("给你挑了一张。")
+        connector = QQConnector(owner_chat_id=42, pair_code="secret-pairing-code-123",
+                                expected_self_uin="88888888", handler=handler, bot=object(), memory=memory)
+        sent = []
+
+        async def action(ws, name, params):
+            sent.append((name, params))
+            if name == "get_friend_msg_history":
+                return {"messages": [{"user_id": 12345678, "message_id": 3, "message": [
+                    {"type": "image", "data": {"file": "another.gif", "sub_type": 1}},
+                    {"type": "image", "data": {"emoji_package_id": "12", "emoji_id": "market-1",
+                                                "key": "qq-market-key", "summary": "抱抱"}}]}]}
+            return {"message_id": 10}
+
+        connector.action = action
+        event = {"post_type": "message", "message_type": "private", "self_id": 88888888,
+                 "user_id": 12345678, "message_id": 4,
+                 "message": [{"type": "text", "data": {"text": "给我发个表情包"}}]}
+        await connector.handle_event(None, event)
+        expected = {"emoji_package_id": 12, "emoji_id": "market-1", "key": "qq-market-key", "summary": "抱抱"}
+        self.assertEqual(sent[-1][1]["message"], [{"type": "mface", "data": expected}])
+        self.assertEqual(len(qq_stickers.load(memory.get_setting(42, qq_stickers.SETTING_KEY))), 2)
+        await connector.handle_event(None, {**event, "message_id": 5})
+        self.assertEqual(len([name for name, _ in sent if name == "get_friend_msg_history"]), 1)
+
     def test_untrusted_image_files_are_not_saved(self):
         for name in ("/etc/passwd", "https://qpic.cn/pic", "base64://AAAA", "..\\bad"):
             stickers, changed = qq_stickers.remember(None, {"message_id": 1, "message": [
