@@ -9,6 +9,7 @@ import random
 import re
 import time
 import uuid
+from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
 
 from qq_gateway import QQGateway
@@ -277,6 +278,16 @@ class QQConnector:
         if not parsed:
             return False
         kind, detail = parsed
+        if kind == 'status':
+            last_at = int(self.memory.get_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_POST_KEY) or 0)
+            last_content = self.memory.get_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_CONTENT_KEY) or ''
+            if last_at:
+                date = datetime.fromtimestamp(last_at, qq_qzone.BEIJING).strftime('%m月%d日 %H:%M')
+                message = f'我这里确认上次发表是在{date}。' + (f'那条写的是：{last_content}' if last_content else '')
+            else:
+                message = '我这里还没有确认发表成功的说说记录。'
+            await self._send_text(ws, sender, message)
+            return True
         if kind.startswith('auto_'):
             if kind == 'auto_on':
                 self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_ENABLED_KEY, '1')
@@ -294,6 +305,24 @@ class QQConnector:
             self.memory.set_setting(self.owner_chat_id, qq_qzone.PENDING_KEY, '')
             await self._send_text(ws, sender, '好，这条说说不发了。')
             return True
+        if kind == 'immediate':
+            if self.memory.get_setting(self.owner_chat_id, qq_qzone.LAST_REQUEST_KEY) == str(message_id):
+                await self._send_text(ws, sender, '这条发帖请求已经处理过了，去空间看一下结果。')
+                return True
+            if len(detail) > qq_qzone.MAX_POST_CHARS:
+                await self._send_text(ws, sender, '正文有点长，压到300字以内再发给我。')
+                return True
+            self.memory.set_setting(self.owner_chat_id, qq_qzone.LAST_REQUEST_KEY, str(message_id))
+            try:
+                if not detail:
+                    detail = await qq_qzone.generate_requested_post(self.bot, self.owner_chat_id)
+                async with self.qzone_auto_lock:
+                    await self._post_qzone(ws, detail, visibility=4)
+                await self._send_text(ws, sender, '发到 QQ 空间了，好友可见。\n' + detail)
+            except Exception as exc:
+                print(f'QQ Qzone requested post uncertain: {type(exc).__name__}', flush=True)
+                await self._send_text(ws, sender, '这条还不能确认发成功。先去空间看一眼，别重复发同一句。')
+            return True
         if kind == 'confirm':
             # Claim the exact QQ confirmation event before calling the remote API.
             # A timeout can occur after publishing, so never retry that event.
@@ -307,11 +336,8 @@ class QQConnector:
             self.memory.set_setting(self.owner_chat_id, qq_qzone.LAST_CONFIRM_KEY, str(message_id))
             self.memory.set_setting(self.owner_chat_id, qq_qzone.PENDING_KEY, '')
             try:
-                result = await self.action(ws, 'send_qzone_msg', {
-                    'content': content, 'images': [], 'ugc_right': 1, 'target_uins': [],
-                })
-                if not isinstance(result, dict) or not result.get('tid'):
-                    raise RuntimeError('Qzone did not return a post id')
+                async with self.qzone_auto_lock:
+                    await self._post_qzone(ws, content, visibility=1)
                 await self._send_text(ws, sender, '发到 QQ 空间了。')
             except Exception as exc:
                 print(f'QQ Qzone post uncertain: {type(exc).__name__}', flush=True)
@@ -342,6 +368,17 @@ class QQConnector:
                               + detail + '\n\n确定的话，10分钟内回复“确认发表空间说说”；也可以说“取消发表空间说说”。')
         return True
 
+    async def _post_qzone(self, ws, content, *, visibility):
+        """Only a returned Qzone tid counts as confirmation of a publish."""
+        result = await self.action(ws, 'send_qzone_msg', {
+            'content': content, 'images': [], 'ugc_right': visibility, 'target_uins': [],
+        })
+        if not isinstance(result, dict) or not result.get('tid'):
+            raise RuntimeError('Qzone did not return a post id')
+        self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_POST_KEY, str(int(time.time())))
+        self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_CONTENT_KEY, content)
+        return result['tid']
+
     async def _qzone_auto_tick(self, ws, *, cue=False):
         if ws is not self.ws or not self.owner_uin():
             return
@@ -362,13 +399,7 @@ class QQConnector:
                 self.bot, self.owner_chat_id, previous, last_post, cue=cue)
             if not content or ws is not self.ws or read(qq_qzone.AUTO_ENABLED_KEY) == '0':
                 return
-            result = await self.action(ws, 'send_qzone_msg', {
-                'content': content, 'images': [], 'ugc_right': 4, 'target_uins': [],
-            })
-            if not isinstance(result, dict) or not result.get('tid'):
-                raise RuntimeError('Qzone did not return a post id')
-            self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_POST_KEY, str(int(time.time())))
-            self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_CONTENT_KEY, content)
+            await self._post_qzone(ws, content, visibility=4)
             print('QQ Qzone automatic post published', flush=True)
 
     async def _qzone_auto_loop(self, ws):
@@ -669,6 +700,9 @@ class QQConnector:
                              '本轮文字回复后会立即发送QQ原生猜拳，出拳由QQ随机生成，你现在不知道结果')
         elif music_card:
             native_status = '本轮文字回复后会立即发送用户给出的QQ或网易云歌曲卡片；不要声称你听过它'
+        elif '空间' in text or '说说' in text:
+            native_status = ('你没有读取QQ空间动态的能力。只有收到发表接口返回的成功结果，'
+                             '才能说自己发了；不要声称看过空间动态或已经发表。')
         try:
             stickers = await self._remember_stickers(event)
         except Exception as exc:
