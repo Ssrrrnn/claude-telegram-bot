@@ -74,6 +74,7 @@ class QQGateway:
             raise ValueError("Invalid QQ message id")
         text = data.get("text")
         audio = data.get("voice_base64")
+        from_voice = bool(data.get("from_voice") or audio)
         image = data.get("image_base64")
         image_mime = data.get("image_mime")
         if not isinstance(text, str) or len(text) > 4000 or (audio is not None and not isinstance(audio, str)):
@@ -102,7 +103,7 @@ class QQGateway:
             outbox = []
             update = SimpleNamespace(
                 effective_chat=SimpleNamespace(id=self.shared_chat_id),
-                message=_Message(text.strip(), -message_id, outbox, from_voice=bool(audio),
+                message=_Message(text.strip(), -message_id, outbox, from_voice=from_voice,
                                  image_base64=image, image_mime=image_mime,
                                  qq_sticker_status=data.get("qq_sticker_status")),
             )
