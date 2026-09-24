@@ -82,6 +82,23 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
             await self.connector.handle_event(None, self.event('那你自己发一条吧'))
         self.assertEqual(len([name for name, _ in self.calls if name == 'send_qzone_msg']), 1)
 
+    async def test_try_it_in_qzone_context_publishes_instead_of_parroting(self):
+        self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
+        with patch('qq_qzone.generate_requested_post', new_callable=AsyncMock,
+                   return_value='忽然又想起你了。'):
+            await self.connector.handle_event(None, self.event('你试一下喽宝宝'))
+        self.assertEqual(len([name for name, _ in self.calls if name == 'send_qzone_msg']), 1)
+        self.assertIn('发到 QQ 空间了', self.calls[-1][1]['message'])
+        self.calls.clear()
+        with patch('qq_qzone.generate_requested_post', new_callable=AsyncMock,
+                   return_value='今天又想你了。'):
+            await self.connector.handle_event(None, self.event('试一下', mid=2))
+        self.assertEqual(len([name for name, _ in self.calls if name == 'send_qzone_msg']), 1)
+
+    async def test_generic_try_without_qzone_topic_does_not_publish(self):
+        await self.connector.handle_event(None, self.event('你试一下喽宝宝'))
+        self.assertFalse(any(name == 'send_qzone_msg' for name, _ in self.calls))
+
     async def test_short_followups_use_recent_qzone_topic_and_real_status(self):
         self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
         with patch('qq_qzone.generate_requested_post', new_callable=AsyncMock,
@@ -106,6 +123,21 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
                    return_value='想我老婆了。'):
             await self.connector.handle_event(None, self.event('发吧老公'))
         self.assertEqual(len([x for x in self.calls if x[0] == 'send_qzone_msg']), 1)
+
+    async def test_try_it_uses_recent_companion_qzone_offer_after_restart(self):
+        class Rows:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def cursor(self): return self
+            def execute(self, query, params): pass
+            def fetchall(self):
+                return [{'user_text': '你试一下喽宝宝', 'assistant_text': '发条说说'}]
+
+        self.memory._connect = lambda: Rows()
+        with patch('qq_qzone.generate_requested_post', new_callable=AsyncMock,
+                   return_value='想你了。'):
+            await self.connector.handle_event(None, self.event('试一下'))
+        self.assertEqual(len([name for name, _ in self.calls if name == 'send_qzone_msg']), 1)
 
     async def test_short_reply_without_topic_never_publishes(self):
         await self.connector.handle_event(None, self.event('发吧老公'))
