@@ -165,6 +165,8 @@ class QQConnector:
         self.offline_alert_task = None
         self.stopping = False
         self.qzone_auto_lock = asyncio.Lock()
+        self.login_failures = 0
+        self.account_offline = False
 
     def owner_uin(self):
         configured = os.getenv("QQ_OWNER_UIN", "").strip()
@@ -228,19 +230,53 @@ class QQConnector:
     async def _status_loop(self, ws):
         while True:
             try:
-                await self._refresh_status(ws)
+                healthy = await self._check_login(ws)
+                if healthy:
+                    await self._refresh_status(ws)
             except Exception as exc:
                 print(f"QQ display status check skipped: {type(exc).__name__}", flush=True)
-            await asyncio.sleep(5 * 60)
+                healthy = False
+            await asyncio.sleep(5 * 60 if healthy else 60)
+
+    async def _check_login(self, ws):
+        try:
+            status = await asyncio.wait_for(self.action(ws, 'get_status', {}), timeout=10)
+            if not isinstance(status, dict) or status.get('online') is not True:
+                raise ValueError('QQ account is offline')
+            data = await asyncio.wait_for(self.action(ws, 'get_login_info', {}), timeout=10)
+            if not isinstance(data, dict) or str(data.get('user_id')) != self.expected_self_uin:
+                raise ValueError('QQ account is not logged in')
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.login_failures += 1
+            print(f'QQ login check failed: {type(exc).__name__}, count={self.login_failures}', flush=True)
+            if self.login_failures >= 2 and not self.account_offline:
+                self.account_offline = True
+                if self.ws is ws:
+                    self.ws = None
+                self._cancel_offline_alert()
+                self.offline_alert_task = asyncio.create_task(self._alert_if_still_offline())
+            return False
+        if self.account_offline:
+            print('QQ account login restored', flush=True)
+        self.account_offline = False
+        self.login_failures = 0
+        self.ws = ws
+        self._cancel_offline_alert()
+        return True
 
     async def _alert_if_still_offline(self):
         try:
             await asyncio.sleep(OFFLINE_ALERT_DELAY_SECONDS)
             if (self.ever_connected and not self.stopping and self.ws is None
                     and self.owner_uin() and self.telegram_bot):
+                message = ('QQ 小号已离线，需要到 NapCat 重新扫码登录，才能继续在 QQ 聊天和发空间说说。'
+                           if self.account_offline else
+                           'QQ 这边暂时断开了，我正在重连。你可以先在 Telegram 找我。')
                 await self.telegram_bot.send_message(
                     chat_id=self.owner_chat_id,
-                    text='QQ 这边暂时断开了，我正在重连。你可以先在 Telegram 找我。',
+                    text=message,
                 )
         except asyncio.CancelledError:
             pass
@@ -400,6 +436,8 @@ class QQConnector:
 
     async def _post_qzone(self, ws, content, *, visibility):
         """Only a returned Qzone tid counts as confirmation of a publish."""
+        if self.account_offline or ws is not self.ws:
+            raise RuntimeError('QQ account is offline')
         result = await self.action(ws, 'send_qzone_msg', {
             'content': content, 'images': [], 'ugc_right': visibility, 'target_uins': [],
         })
@@ -837,6 +875,7 @@ class QQConnector:
                 ) as ws:
                     self.ws = ws
                     self.ever_connected = True
+                    self.login_failures = 0
                     self._cancel_offline_alert()
                     self.last_status = None
                     self.last_status_at = 0
