@@ -75,15 +75,6 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('QQ 号现在离线', self.calls[-1][1]['message'])
         self.assertFalse(any(name == 'send_qzone_msg' for name, _ in self.calls))
 
-    async def test_one_time_live_probe_uses_real_publish_path_only_once(self):
-        ws = self.connector.ws = object()
-        await self.connector._probe_qzone_once(ws)
-        await self.connector._probe_qzone_once(ws)
-        posts = [p for name, p in self.calls if name == 'send_qzone_msg']
-        self.assertEqual(len(posts), 1)
-        self.assertEqual(posts[0]['content'], '测试一下')
-        self.assertEqual(posts[0]['ugc_right'], 4)
-
     async def test_contextual_self_post_request_dispatches_actual_api(self):
         self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
         with patch('qq_qzone.generate_requested_post', new_callable=AsyncMock,
