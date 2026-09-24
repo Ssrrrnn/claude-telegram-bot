@@ -88,10 +88,77 @@ class QQTests(unittest.IsolatedAsyncioTestCase):
 
     def test_sticker_requests_respect_negation_and_saved_stickers_are_bounded(self):
         self.assertTrue(qq_stickers.explicit_request("来张表情包"))
+        self.assertTrue(qq_stickers.explicit_request("发表情包给我"))
         self.assertFalse(qq_stickers.explicit_request("别发个表情包了"))
         self.assertFalse(qq_stickers.explicit_request("怎么还没发表情包"))
         self.assertEqual(qq_stickers.remember(None, {"message": [{"type": "mface",
             "data": {"emoji_package_id": 1, "emoji_id": "", "key": "bad"}}]}), ([], False))
+
+    async def test_owner_image_is_saved_before_download_timeout_and_can_be_sent(self):
+        memory = FakeMemory()
+        memory.set_setting(42, "qq_owner_uin_v1", "12345678")
+        connector = QQConnector(owner_chat_id=42, pair_code="secret-pairing-code-123",
+                                expected_self_uin="88888888", handler=None, bot=object(), memory=memory)
+        sent = []
+
+        async def action(ws, name, params):
+            sent.append((name, params))
+            if name == "get_msg":
+                return {"message": [{"type": "image", "data": {"file": "sticker.gif"}}]}
+            return {"message_id": 100}
+
+        async def unavailable(ws, data): raise TimeoutError()
+        connector.action = action
+        connector._image_content = unavailable
+        base = {"post_type": "message", "message_type": "private", "self_id": 88888888,
+                "user_id": 12345678}
+        await connector.handle_event(None, {**base, "message_id": 42, "message": [
+            {"type": "image", "data": {"file": "sticker.gif", "sub_type": 1}}]})
+        saved = qq_stickers.load(memory.get_setting(42, qq_stickers.SETTING_KEY))
+        self.assertEqual(saved[0]["file"], "sticker.gif")
+        self.assertEqual(sent[-1][1]["message"], "这张图我收到了，但现在没加载出来，暂时看不清内容。")
+
+        async def handler(update, context): await update.message.reply_text("发给你。")
+        connector.handler = handler
+        connector.gateway = None
+        await connector.handle_event(None, {**base, "message_id": 43, "message": [
+            {"type": "text", "data": {"text": "发表情包给我"}}]})
+        self.assertEqual(sent[-1][1]["message"], [{"type": "image", "data": {
+            "file": "sticker.gif", "sub_type": 1}}])
+
+    async def test_sticker_request_recovers_images_from_owner_history_only(self):
+        memory = FakeMemory()
+        memory.set_setting(42, "qq_owner_uin_v1", "12345678")
+
+        async def handler(update, context): await update.message.reply_text("来了。")
+        connector = QQConnector(owner_chat_id=42, pair_code="secret-pairing-code-123",
+                                expected_self_uin="88888888", handler=handler, bot=object(), memory=memory)
+        sent = []
+
+        async def action(ws, name, params):
+            sent.append((name, params))
+            if name == "get_friend_msg_history":
+                return {"messages": [
+                    {"user_id": 99999999, "message_id": 1, "message": [
+                        {"type": "image", "data": {"file": "other.jpg"}}]},
+                    {"user_id": 12345678, "message_id": 2, "message": [
+                        {"type": "image", "data": {"file": "owner.gif", "sub_type": 1}}]},
+                ]}
+            return {"message_id": 5}
+
+        connector.action = action
+        await connector.handle_event(None, {"post_type": "message", "message_type": "private",
+            "self_id": 88888888, "user_id": 12345678, "message_id": 4,
+            "message": [{"type": "text", "data": {"text": "来张表情包"}}]})
+        self.assertEqual(sent[-1][1]["message"][0]["data"]["file"], "owner.gif")
+        self.assertEqual([item["file"] for item in qq_stickers.load(
+            memory.get_setting(42, qq_stickers.SETTING_KEY))], ["owner.gif"])
+
+    def test_untrusted_image_files_are_not_saved(self):
+        for name in ("/etc/passwd", "https://qpic.cn/pic", "base64://AAAA", "..\\bad"):
+            stickers, changed = qq_stickers.remember(None, {"message_id": 1, "message": [
+                {"type": "image", "data": {"file": name}}]})
+            self.assertEqual((stickers, changed), ([], False))
 
     def test_qq_sticker_segments_are_not_dropped(self):
         event = {"message": [
