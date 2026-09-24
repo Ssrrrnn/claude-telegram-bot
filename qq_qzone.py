@@ -22,6 +22,11 @@ BEIJING = ZoneInfo('Asia/Shanghai')
 
 def command(text):
     value = text.strip()
+    if ('：' not in value and ':' not in value
+            and re.search(r'(?:QQ空间|空间说说|发说说|发表说说|发表空间|空间发帖)', value) and re.search(
+        r'(?:能不能|可不可以|会不会|有没有|有无|有.{0,8}权限|没有.{0,8}权限|怎么|如何|调用|接口|(?:能|会|可以).{0,12}[吗？?])', value,
+    ) and not re.search(r'(?:别发|不要发|先别发)', value)):
+        return 'help', ''
     if re.fullmatch(r'(?:你|老公)?(?:怎么|如何)(?:让你|教你|才能)?(?:发|发表)(?:QQ|空间)?说说(?:呢|啊|呀|吗)?[？?。！!]*', value) or re.fullmatch(
         r'(?:给你|给我|教你|告诉你)(?:一份|一个)?(?:发|发表)(?:QQ|空间)?说说(?:的)?教程[？?。！!]*', value,
     ):
@@ -66,6 +71,10 @@ def topic_mentioned(text):
 def contextual_command(text):
     """Handle short follow-ups only when the conversation is about QQ Space."""
     value = text.strip(' 。！!？?，,')
+    if re.fullmatch(r'(?:你|老公)?(?:到底)?(?:有|没有|有没有|有无)(?:实际)?(?:调用|发帖|发表)?权限(?:吗|呢|啊)?', value) or re.fullmatch(
+        r'(?:你|老公)?(?:到底)?(?:能|可以|会)(?:实际)?(?:调用|发表|发)(?:吗|呢|啊)?', value,
+    ):
+        return 'help', ''
     if re.fullmatch(r'(?:那|就|你|老公|现在|直接|赶紧|快|去|可以|给我|嗯|好|行|的|吧|啊|呀|嘛|先|再|就这样)*发(?:吧|一下|一条|出去|说说)?(?:老公|亲爱的|吧|呀|啊|嘛)?', value) or re.fullmatch(
         r'(?:那|就|你|老公|现在|直接|赶紧|快|去|可以|给我|就这样)*自己发(?:一条|条)?(?:吧|呀|啊|嘛)?', value,
     ):
