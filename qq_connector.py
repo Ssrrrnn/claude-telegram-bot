@@ -198,7 +198,7 @@ class QQConnector:
                                     json.dumps(stickers, ensure_ascii=False))
         return stickers
 
-    async def _recover_owner_stickers(self, ws, sender, stickers):
+    async def _recover_owner_stickers(self, ws, sender, stickers, *, market_only=False):
         """Recover recent images already sent by the paired owner, on demand."""
         try:
             history = await self.action(ws, "get_friend_msg_history", {
@@ -212,12 +212,26 @@ class QQConnector:
             for event in messages:
                 if not isinstance(event, dict) or str(event.get("user_id")) != str(sender):
                     continue
+                if market_only:
+                    segments = event.get("message")
+                    if not isinstance(segments, list):
+                        continue
+                    native = [segment for segment in segments if isinstance(segment, dict) and (
+                        segment.get("type") == "mface" or
+                        segment.get("type") == "image" and isinstance(segment.get("data"), dict) and
+                        all(key in segment["data"] for key in ("emoji_package_id", "emoji_id", "key"))
+                    )]
+                    if not native:
+                        continue
+                    event = {**event, "message": native}
                 stickers, added = qq_stickers.remember(raw, event)
                 if added:
                     raw = json.dumps(stickers, ensure_ascii=False)
                     changed = True
             if changed:
                 self.memory.set_setting(self.owner_chat_id, qq_stickers.SETTING_KEY, raw)
+            self.memory.set_setting(self.owner_chat_id, qq_stickers.MARKET_DISCOVERY_AT_KEY,
+                                    str(time.time()))
             return stickers
         except Exception as exc:
             print(f"QQ sticker history unavailable: {type(exc).__name__}", flush=True)
@@ -228,7 +242,8 @@ class QQConnector:
         if not stickers or incoming_sticker and not requested:
             return False
         if requested:
-            candidates = stickers
+            # Native market faces preserve QQ's sticker animation and identity.
+            candidates = [item for item in stickers if "emoji_id" in item] or stickers
         else:
             if len(stickers) < 2:
                 return False
@@ -345,8 +360,14 @@ class QQConnector:
         except Exception as exc:
             print(f"QQ sticker library skipped: {type(exc).__name__}", flush=True)
             stickers = []
-        if qq_stickers.explicit_request(text) and not stickers:
-            stickers = await self._recover_owner_stickers(ws, sender, stickers)
+        if qq_stickers.explicit_request(text) and not any("emoji_id" in item for item in stickers):
+            last_scan = self.memory.get_setting(self.owner_chat_id, qq_stickers.MARKET_DISCOVERY_AT_KEY)
+            try:
+                recently_scanned = time.time() - float(last_scan or 0) < 24 * 60 * 60
+            except (ValueError, TypeError):
+                recently_scanned = False
+            if not recently_scanned:
+                stickers = await self._recover_owner_stickers(ws, sender, stickers, market_only=bool(stickers))
         image_base64 = image_mime = None
         if images:
             try:
