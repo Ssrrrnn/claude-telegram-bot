@@ -6,6 +6,7 @@ from io import BytesIO
 import json
 import os
 import random
+import re
 import time
 import uuid
 from urllib.parse import urlsplit, urlunsplit
@@ -14,6 +15,7 @@ from qq_gateway import QQGateway
 from qq_face_names import FACE_NAMES
 import qq_stickers
 import qq_status
+import qq_music
 
 OWNER_KEY = "qq_owner_uin_v1"
 PLATFORM_KEY = "last_active_platform_v1"
@@ -22,6 +24,7 @@ MAX_IMAGE_BYTES = 4_000_000
 CUSTOM_FACE_REFRESH_SECONDS = 24 * 60 * 60
 REACTION_COOLDOWN_SECONDS = 4 * 60 * 60
 POKE_COOLDOWN_SECONDS = 12 * 60 * 60
+OFFLINE_ALERT_DELAY_SECONDS = 120
 
 
 def _qq_image_url(value):
@@ -100,6 +103,17 @@ def _message_text(event):
     return _message_parts(event)[0]
 
 
+def _requested_game(text):
+    value = text.strip(' 。！!？?')
+    if re.search(r'^(?:你|帮我|给我|我们|一起|来|再|直接|想|要不要|可以|请|玩|发个|发一颗|给你)?\s*'
+                 r'(?:掷|扔|丢|摇|投)(?:个|一颗|一下)?骰子', value) and len(value) < 50:
+        return 'dice'
+    if re.search(r'^(?:你|我们|一起|来|再|直接|想|要不要|可以|请|玩|跟我)?\s*'
+                 r'(?:玩)?(?:石头剪刀布|猜拳)', value) and len(value) < 50:
+        return 'rps'
+    return None
+
+
 def _private_message(event, self_uin):
     if event.get("post_type") != "message" or event.get("message_type") != "private":
         return False
@@ -122,13 +136,15 @@ def last_chat_platform(memory, chat_id):
 
 
 class QQConnector:
-    def __init__(self, *, owner_chat_id, pair_code, expected_self_uin, handler, bot, memory):
+    def __init__(self, *, owner_chat_id, pair_code, expected_self_uin, handler, bot, memory,
+                 telegram_bot=None):
         self.owner_chat_id = int(owner_chat_id)
         self.pair_code = pair_code
         self.expected_self_uin = str(expected_self_uin)
         self.handler = handler
         self.bot = bot
         self.memory = memory
+        self.telegram_bot = telegram_bot
         self.pending = {}
         self.gateway = None
         self.gateway_uin = None
@@ -143,6 +159,9 @@ class QQConnector:
         self.last_status_at = 0
         self.last_user_at = 0
         self.love_until = 0
+        self.ever_connected = False
+        self.offline_alert_task = None
+        self.stopping = False
 
     def owner_uin(self):
         configured = os.getenv("QQ_OWNER_UIN", "").strip()
@@ -206,6 +225,50 @@ class QQConnector:
             except Exception as exc:
                 print(f"QQ display status check skipped: {type(exc).__name__}", flush=True)
             await asyncio.sleep(5 * 60)
+
+    async def _alert_if_still_offline(self):
+        try:
+            await asyncio.sleep(OFFLINE_ALERT_DELAY_SECONDS)
+            if (self.ever_connected and not self.stopping and self.ws is None
+                    and self.owner_uin() and self.telegram_bot):
+                await self.telegram_bot.send_message(
+                    chat_id=self.owner_chat_id,
+                    text='QQ 这边暂时断开了，我正在重连。你可以先在 Telegram 找我。',
+                )
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(f'QQ offline alert failed: {type(exc).__name__}', flush=True)
+
+    def _cancel_offline_alert(self):
+        if self.offline_alert_task and not self.offline_alert_task.done():
+            self.offline_alert_task.cancel()
+        self.offline_alert_task = None
+
+    async def _quoted_context(self, ws, event, sender):
+        segments = event.get('message')
+        if not isinstance(segments, list):
+            return None
+        for segment in segments:
+            if not isinstance(segment, dict) or segment.get('type') != 'reply':
+                continue
+            data = segment.get('data') or {}
+            mid = str(data.get('id', ''))
+            if not mid.isdigit() or not 0 < int(mid) < 2**63:
+                return '用户引用了一条消息，但无法读取其内容'
+            try:
+                quoted = await asyncio.wait_for(self.action(ws, 'get_msg', {'message_id': int(mid)}), timeout=6)
+                if not isinstance(quoted, dict) or str(quoted.get('user_id')) not in (sender, self.expected_self_uin):
+                    raise ValueError('Quoted sender unverified')
+                if str(quoted.get('message_type', 'private')) != 'private':
+                    raise ValueError('Quote is not private')
+                content = _message_text(quoted).replace('\n', ' ').strip()[:260]
+                who = '你' if str(quoted.get('user_id')) == self.expected_self_uin else '用户'
+                return f'{who}之前说：{content or "[一条媒体消息]"}'
+            except Exception as exc:
+                print(f'QQ quoted message unavailable: {type(exc).__name__}', flush=True)
+                return '用户引用了一条消息，但内容暂时无法读取'
+        return None
 
     async def _send_market_sticker(self, ws, sender, sticker):
         await self.action(ws, "send_private_msg", {
@@ -460,6 +523,10 @@ class QQConnector:
         segments = event.get("message")
         record = isinstance(segments, list) and any(isinstance(segment, dict) and
                      segment.get("type") == "record" for segment in segments)
+        has_reply = isinstance(segments, list) and any(isinstance(segment, dict) and
+                    segment.get('type') == 'reply' for segment in segments)
+        if not text and has_reply:
+            text = '你看这句。'
         if not text or len(text) > MAX_MESSAGE_CHARS:
             return
         if record:
@@ -473,6 +540,16 @@ class QQConnector:
                 print(f"QQ voice transcription unavailable: {type(exc).__name__}", flush=True)
                 await self._send_text(ws, sender, "刚才那段语音没听清，打字告诉我，好吗？")
                 return
+        quoted_context = await self._quoted_context(ws, event, sender)
+        game = _requested_game(text)
+        music_card = qq_music.card(text)
+        native_status = None
+        if game:
+            native_status = ('本轮文字回复后会立即发送QQ原生骰子，点数由QQ随机生成，你现在不知道结果'
+                             if game == 'dice' else
+                             '本轮文字回复后会立即发送QQ原生猜拳，出拳由QQ随机生成，你现在不知道结果')
+        elif music_card:
+            native_status = '本轮文字回复后会立即发送用户给出的QQ或网易云歌曲卡片；不要声称你听过它'
         try:
             stickers = await self._remember_stickers(event)
         except Exception as exc:
@@ -515,9 +592,19 @@ class QQConnector:
                 "image_base64": image_base64, "image_mime": image_mime,
                 "qq_sticker_status": ("available" if stickers else "empty")
                 if qq_stickers.explicit_request(text) else None,
+                'quoted_context': quoted_context, 'qq_native_status': native_status,
             })
             await self._send_replies(ws, sender, response["replies"])
             if not response.get("duplicate"):
+                if game or music_card:
+                    try:
+                        await self.action(ws, 'send_private_msg', {
+                            'user_id': int(sender), 'message': [
+                                music_card or {'type': game, 'data': {}}],
+                        })
+                    except Exception as exc:
+                        print(f'QQ native card unavailable: {type(exc).__name__}', flush=True)
+                        await self._send_text(ws, sender, '刚才那个QQ卡片没发出去。')
                 self.last_user_at = time.time()
                 if qq_status.affectionate(text):
                     self.love_until = self.last_user_at + qq_status.LOVE_SECONDS
@@ -553,6 +640,8 @@ class QQConnector:
                     max_size=2 * 1024 * 1024, ping_interval=25,
                 ) as ws:
                     self.ws = ws
+                    self.ever_connected = True
+                    self._cancel_offline_alert()
                     self.last_status = None
                     self.last_status_at = 0
                     print("QQ OneBot private connection ready", flush=True)
@@ -588,6 +677,8 @@ class QQConnector:
                     if not future.done():
                         future.cancel()
                 self.pending.clear()
+                if self.ever_connected and not self.stopping and self.offline_alert_task is None:
+                    self.offline_alert_task = asyncio.create_task(self._alert_if_still_offline())
             await asyncio.sleep(6)
 
 
@@ -613,6 +704,7 @@ async def start(application, *, handler, bot, memory):
     connector = QQConnector(
         owner_chat_id=bot.TELEGRAM_OWNER_ID, pair_code=pair_code,
         expected_self_uin=self_uin, handler=handler, bot=bot, memory=memory,
+        telegram_bot=application.bot,
     )
     task = asyncio.create_task(connector.run(url, token), name="qq-onebot-connector")
     application.bot_data["qq_connector"] = connector
@@ -620,6 +712,10 @@ async def start(application, *, handler, bot, memory):
 
 
 async def stop(application):
+    connector = application.bot_data.get('qq_connector')
+    if connector:
+        connector.stopping = True
+        connector._cancel_offline_alert()
     task = application.bot_data.get("qq_onebot_task")
     if task:
         task.cancel()
