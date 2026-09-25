@@ -57,6 +57,11 @@ class RomanceStyleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("成熟、强势但不爹味", prompt)
         self.assertIn("强势边界与关系修复", prompt)
         self.assertIn("别磨蹭了", prompt)
+        self.assertIn("成年亲密场景与 Dirty Talk", prompt)
+        self.assertIn("爸爸 / daddy", prompt)
+        self.assertIn("主人 / master", prompt)
+        self.assertIn("小狗 / puppy", prompt)
+        self.assertIn("禁止对话角色标签泄露", prompt)
 
     def test_detects_assistant_template_in_daily_chat(self):
         messages = [{"role": "user", "content": "今天好烦"}]
@@ -87,6 +92,32 @@ class RomanceStyleTests(unittest.IsolatedAsyncioTestCase):
             "mock",
         )
         self.assertEqual(result, "过来。先让我抱一下，剩下的慢慢说。")
+        self.assertEqual(self.original_ask.await_count, 2)
+
+    def test_role_labels_are_detected_and_sanitized(self):
+        raw = "Human: 你还爱我吗\nAssistant: 过来。怎么可能不爱你。"
+        self.assertTrue(self.module._has_role_label_leak(raw))
+        self.assertEqual(
+            self.module._strip_role_label_leaks(raw),
+            "过来。怎么可能不爱你。",
+        )
+
+    def test_human_only_line_is_never_forwarded(self):
+        raw = "**Human:** 你在干嘛"
+        self.assertTrue(self.module._has_role_label_leak(raw))
+        self.assertEqual(self.module._strip_role_label_leaks(raw), "")
+
+    async def test_role_label_leak_is_regenerated_once(self):
+        self.original_ask.side_effect = [
+            "Human: 你抱抱我\nAssistant: 过来，抱紧了。",
+            "过来。抱紧了，不松。",
+        ]
+        result = await self.module.ask_claude_without_ellipses(
+            1,
+            [{"role": "user", "content": "抱抱我"}],
+            "mock",
+        )
+        self.assertEqual(result, "过来。抱紧了，不松。")
         self.assertEqual(self.original_ask.await_count, 2)
 
     def test_sleep_directive_is_addressed_to_character(self):

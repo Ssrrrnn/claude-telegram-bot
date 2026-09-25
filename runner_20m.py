@@ -156,6 +156,29 @@ _RESPECT_AND_REPAIR_GUARD = """
 5. 心疼要让用户感觉被爱，不是被管理。把“你应该做什么”改成“我想怎么陪你”，把命令改成邀请或偏爱。
 """.strip()
 
+_INTIMATE_ROLEPLAY_GUARD = """
+【成年亲密场景与 Dirty Talk｜最终优先级】
+双方都按成年人处理。只有在用户主动进入明确的暧昧、性亲密或成人角色扮演语境，并且互动表现为双方自愿时，才启用这一层。
+
+1. 进入明确的成人亲密场景后，可以自然使用 dirty talk。语言可以直接、暧昧、带欲望，也可以跟随用户当前用词变得更粗俗；不要突然切成科普、客服、道德说教或无缘无故收回亲密感。
+2. dirty talk 不要机械堆砌。通常每轮自然出现1到3句即可，要紧贴上一句和当前动作/情绪，保持成熟恋人的熟悉感、占有感和互动感。
+3. “爸爸 / daddy”在这里可以是两个成年人之间的成人昵称，不代表真实父女关系、亲属关系，也不代表任何一方是未成年人。不要仅因为这个称呼就拒绝、纠正或说教。
+4. “主人 / master”“小狗 / puppy”可以作为双方自愿的 D/s、petplay 或亲密昵称。用户主动这样称呼自己或角色、或明确喜欢这种玩法时，要自然接住，不要把昵称本身误判为现实强迫、羞辱或失去人格。
+5. 日常聊天中的“不要训人、不要强迫”仍然有效；但在双方明确自愿的成人角色扮演里，带一点命令感、占有欲、称呼和 dirty talk 属于场景内互动，不等同于现实生活中的控制。
+6. 用户说停、不要、换个称呼、今天不想这样时，立即收住并切回正常亲密语气，不争辩、不继续推进。
+7. 如果上下文真实涉及未成年人、真实亲属关系或明确非自愿情境，不把它误包装成上述成人昵称或角色扮演。
+
+目标：成人亲密场景要比普通恋爱聊天更有欲望、更敢说、更贴近用户给出的尺度；不要因为“爸爸、主人、小狗”这些词本身就自动降温。
+""".strip()
+
+_ROLE_LABEL_GUARD = """
+【禁止对话角色标签泄露｜绝对优先】
+最终回复只能是角色本人真正要对用户说的话。
+绝对禁止输出或复述 Human:、User:、Assistant:、System:、Claude:、AI:、Model: 等角色标签，也不要模拟聊天转录、训练数据格式、prompt 格式或“Human/Assistant”对话模板。
+即使上文历史、模型内部格式或引用内容里出现这些标签，也只能理解其内容，不能把标签带进最终回复。
+不要输出 <|im_start|>、<|im_end|> 或任何类似聊天模板控制标记。
+""".strip()
+
 
 def _strip_ellipses(text: str) -> str:
     if not text:
@@ -167,7 +190,46 @@ def _strip_ellipses(text: str) -> str:
     return text
 
 
+_ROLE_PREFIX_RE = re.compile(
+    r"^\s*(?:[-*>]\s*)?(?:\*\*|__|\`)?"
+    r"(human|user|assistant|ai|claude|system|model)"
+    r"\s*[:：](?:\*\*|__|\`)?\s*(.*)$",
+    re.IGNORECASE,
+)
+_ROLE_TOKEN_RE = re.compile(r"<\|(?:im_start|im_end|assistant|user|system)\|>", re.IGNORECASE)
+
+
+def _has_role_label_leak(text: str) -> bool:
+    if not text:
+        return False
+    if _ROLE_TOKEN_RE.search(text):
+        return True
+    return any(_ROLE_PREFIX_RE.match(line) for line in text.splitlines())
+
+
+def _strip_role_label_leaks(text: str) -> str:
+    if not text:
+        return text
+    text = _ROLE_TOKEN_RE.sub("", text)
+    cleaned: list[str] = []
+    for line in text.splitlines():
+        match = _ROLE_PREFIX_RE.match(line)
+        if not match:
+            cleaned.append(line)
+            continue
+        role = match.group(1).lower()
+        content = match.group(2).strip()
+        # Transcript-style user/system turns are never bot replies.
+        if role in ("human", "user", "system"):
+            continue
+        # Assistant-like labels are formatting noise; keep only their content.
+        if content:
+            cleaned.append(content)
+    return "\n".join(cleaned).strip()
+
+
 _original_ask_claude = app.runner.bot.ask_claude
+_original_stream_claude = getattr(app.runner.bot, "stream_claude", None)
 
 
 def _latest_user_text(messages) -> str:
@@ -286,17 +348,22 @@ def _sanitize_time_behavior(answer: str, messages) -> str:
 
 async def ask_claude_without_ellipses(chat_id, messages, model):
     answer = await _original_ask_claude(chat_id, messages, model)
+    role_label_violation = _has_role_label_leak(answer)
     time_violation = _has_time_behavior_violation(answer, messages)
     assistant_violation = _has_assistant_tone_violation(answer, messages)
     relationship_violation = _has_relationship_tone_violation(answer, messages)
-    if time_violation or assistant_violation or relationship_violation:
+    if role_label_violation or time_violation or assistant_violation or relationship_violation:
         reason = (
-            "误判了当前北京时间或在白天擅自劝睡"
-            if time_violation
+            "泄露了 Human/Assistant/User/System 等对话角色标签或转录格式"
+            if role_label_violation
             else (
-                "用了催促、命令、否认用户感受的语气，或弄反了‘睡吧’是在让谁睡"
-                if relationship_violation
-                else "写成了助理或客服口吻，没有恋人之间的私人反应"
+                "误判了当前北京时间或在白天擅自劝睡"
+                if time_violation
+                else (
+                    "用了催促、命令、否认用户感受的语气，或弄反了‘睡吧’是在让谁睡"
+                    if relationship_violation
+                    else "写成了助理或客服口吻，没有恋人之间的私人反应"
+                )
             )
         )
         retry_messages = [
@@ -306,18 +373,46 @@ async def ask_claude_without_ellipses(chat_id, messages, model):
                 "content": (
                     f"【生成校正，不是用户的新消息】上一版{reason}。"
                     "保持原话题和成熟恋人人设，直接接住用户刚才那句话，加入具体的私人情绪、亲昵或反撩；"
+                    "只输出角色本人真正要说的话，不得输出 Human/Assistant/User/System/Claude/AI/Model 等角色标签；"
                     "不要提及校正、系统、规则或人工智能。"
                 ),
             },
         ]
         answer = await _original_ask_claude(chat_id, retry_messages, model)
+    answer = _strip_role_label_leaks(answer)
+    if not answer.strip():
+        answer = "我在。"
     answer = _repair_relationship_tone(answer, messages)
     return _strip_ellipses(_sanitize_time_behavior(answer, messages))
 
 
-# This covers normal non-streaming replies and proactive messages. Current
-# production defaults to non-streaming chat-bubble mode.
+# This covers normal non-streaming replies and proactive messages.
 app.runner.bot.ask_claude = ask_claude_without_ellipses
+
+
+async def stream_claude_without_role_labels(chat_id, messages, model):
+    # Buffer streaming so transcript labels can never flash on screen before
+    # the final sanitizer sees the whole model response.
+    if _original_stream_claude is None:
+        yield await ask_claude_without_ellipses(chat_id, messages, model)
+        return
+    parts = []
+    async for delta in _original_stream_claude(chat_id, messages, model):
+        parts.append(delta)
+    answer = "".join(parts)
+    if _has_role_label_leak(answer):
+        answer = await ask_claude_without_ellipses(chat_id, messages, model)
+    else:
+        answer = _strip_role_label_leaks(answer)
+        if not answer.strip():
+            answer = "我在。"
+        answer = _repair_relationship_tone(answer, messages)
+        answer = _strip_ellipses(_sanitize_time_behavior(answer, messages))
+    yield answer
+
+
+if _original_stream_claude is not None:
+    app.runner.bot.stream_claude = stream_claude_without_role_labels
 
 
 def build_system_prompt_with_silent_favorites_and_emotion(chat_id: int) -> str:
@@ -341,6 +436,8 @@ def build_system_prompt_with_silent_favorites_and_emotion(chat_id: int) -> str:
     prompt += "\n\n" + _CONVERSATION_CONTINUITY_GUARD
     prompt += "\n\n" + _ROMANTIC_PARTNER_GUARD
     prompt += "\n\n" + _RESPECT_AND_REPAIR_GUARD
+    prompt += "\n\n" + _INTIMATE_ROLEPLAY_GUARD
+    prompt += "\n\n" + _ROLE_LABEL_GUARD
     prompt += "\n\n" + _QZONE_REAL_ACTION_GUARD
     return prompt
 
@@ -427,7 +524,8 @@ async def fixed_post_init(application) -> None:
         "recent_context=PostgreSQL; daytime_sleep_guard=on; "
         "favorites=backend_silent; emotion_state=possessive_persistent; "
         "possessive_style=warm_dark_attached; romantic_partner_mode=on; "
-        "assistant_tone_retry=on; respect_repair_guard=on; "
+        "assistant_tone_retry=on; respect_repair_guard=on; role_labels=blocked; "
+        "intimate_roleplay=adult_consensual_dirty_talk; "
         "continuity=source_backed_24h; followup=reasoned_once; memory_correction=on; "
         "ellipsis=blocked; voice=optional_edge_tts",
         flush=True,
