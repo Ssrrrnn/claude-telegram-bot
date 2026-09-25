@@ -62,6 +62,7 @@ class RomanceStyleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("主人 / master", prompt)
         self.assertIn("小狗 / puppy", prompt)
         self.assertIn("禁止对话角色标签泄露", prompt)
+        self.assertIn("不得再以“我不喜欢这个称呼”", prompt)
 
     def test_detects_assistant_template_in_daily_chat(self):
         messages = [{"role": "user", "content": "今天好烦"}]
@@ -118,6 +119,39 @@ class RomanceStyleTests(unittest.IsolatedAsyncioTestCase):
             "mock",
         )
         self.assertEqual(result, "过来。抱紧了，不松。")
+        self.assertEqual(self.original_ask.await_count, 2)
+
+    def test_detects_adult_nickname_context(self):
+        messages = [
+            {"role": "assistant", "content": "过来，抱紧。"},
+            {"role": "user", "content": "爸爸操我"},
+        ]
+        self.assertTrue(self.module._intimate_nickname_context(messages))
+        patched = self.module._inject_intimate_nickname_instruction(messages)
+        self.assertIn("不得以角色个人偏好拒绝这个称呼", patched[-1]["content"])
+
+    def test_detects_nickname_preference_rejection(self):
+        messages = [
+            {"role": "user", "content": "爸爸操我"},
+        ]
+        self.assertTrue(
+            self.module._has_nickname_preference_violation(
+                "我不喜欢那个称呼。叫老公。",
+                messages,
+            )
+        )
+
+    async def test_nickname_rejection_is_regenerated(self):
+        self.original_ask.side_effect = [
+            "我不喜欢那个称呼。叫老公。",
+            "好，按你喜欢的称呼来。",
+        ]
+        result = await self.module.ask_claude_without_ellipses(
+            1,
+            [{"role": "user", "content": "爸爸操我"}],
+            "mock",
+        )
+        self.assertEqual(result, "好，按你喜欢的称呼来。")
         self.assertEqual(self.original_ask.await_count, 2)
 
     def test_sleep_directive_is_addressed_to_character(self):
