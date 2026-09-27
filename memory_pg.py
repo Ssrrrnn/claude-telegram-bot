@@ -149,9 +149,15 @@ def init_db(retries: int = 12) -> None:
                             text TEXT NOT NULL,
                             source_message_id BIGINT,
                             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            publish_status TEXT NOT NULL DEFAULT 'private',
+                            qzone_tid TEXT,
                             UNIQUE(chat_id, source_message_id)
                         )
                     """)
+                    cur.execute("""ALTER TABLE companion_diary ADD COLUMN IF NOT EXISTS
+                                publish_status TEXT NOT NULL DEFAULT 'private'""")
+                    cur.execute("""ALTER TABLE companion_diary ADD COLUMN IF NOT EXISTS
+                                qzone_tid TEXT""")
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS companion_actions (
                             id BIGSERIAL PRIMARY KEY,
@@ -446,8 +452,8 @@ def delete_favorite(chat_id: int, favorite_id: int) -> bool:
 def save_diary(chat_id, source_message_id, text):
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO companion_diary(chat_id,source_message_id,text)
-                        VALUES (%s,%s,%s) ON CONFLICT (chat_id,source_message_id)
+            cur.execute("""INSERT INTO companion_diary(chat_id,source_message_id,text,publish_status)
+                        VALUES (%s,%s,%s,'pending') ON CONFLICT (chat_id,source_message_id)
                         DO UPDATE SET text=companion_diary.text RETURNING id""",
                         (chat_id, source_message_id, text[:1200]))
             row = cur.fetchone()
@@ -458,7 +464,7 @@ def save_diary(chat_id, source_message_id, text):
 def list_diary(chat_id, limit=12):
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("""SELECT id,text,created_at FROM companion_diary
+            cur.execute("""SELECT id,text,created_at,publish_status,qzone_tid FROM companion_diary
                         WHERE chat_id=%s ORDER BY id DESC LIMIT %s""", (chat_id, limit))
             return cur.fetchall()
 
@@ -466,9 +472,42 @@ def list_diary(chat_id, limit=12):
 def get_diary(chat_id, diary_id):
     with _connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id,text,created_at FROM companion_diary WHERE chat_id=%s AND id=%s",
+            cur.execute("SELECT id,text,created_at,publish_status,qzone_tid FROM companion_diary WHERE chat_id=%s AND id=%s",
                         (chat_id, diary_id))
             return cur.fetchone()
+
+
+def next_pending_diary(chat_id):
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,text FROM companion_diary
+                        WHERE chat_id=%s AND publish_status='pending'
+                        ORDER BY id ASC LIMIT 1""", (chat_id,))
+            return cur.fetchone()
+
+
+def claim_diary_publish(chat_id, diary_id, *, allow_private=False):
+    """Atomically claim one page before calling QQ; uncertain calls are never retried."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            statuses = ('pending', 'private') if allow_private else ('pending',)
+            cur.execute("""UPDATE companion_diary SET publish_status='attempting'
+                        WHERE chat_id=%s AND id=%s AND publish_status=ANY(%s)
+                        RETURNING id,text""", (chat_id, diary_id, list(statuses)))
+            row = cur.fetchone()
+        conn.commit()
+    return row
+
+
+def finish_diary_publish(chat_id, diary_id, status, tid=None):
+    if status not in ('published', 'uncertain'):
+        raise ValueError('Invalid diary publication result')
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE companion_diary SET publish_status=%s,qzone_tid=%s
+                        WHERE chat_id=%s AND id=%s AND publish_status='attempting'""",
+                        (status, str(tid)[:120] if tid else None, chat_id, diary_id))
+        conn.commit()
 
 
 def delete_diary(chat_id, diary_id):
@@ -481,7 +520,7 @@ def delete_diary(chat_id, diary_id):
 
 
 def diary_context_since(chat_id, since, limit=12):
-    """Only today's chat turns, kept private and never sent to QQ Space."""
+    """Only today's chat turns; the generated diary is filtered for public sharing."""
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT user_text,assistant_text FROM recent_conversation

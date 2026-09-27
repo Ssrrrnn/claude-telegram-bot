@@ -510,6 +510,9 @@ async def proactive_loop(application):
             if chat_id is not None and runner.bot.is_authorized(chat_id):
                 import companion_features
                 await companion_features.auto_diary_tick(runner.memory_pg, runner.bot, chat_id)
+                connector = application.bot_data.get('qq_connector')
+                if connector is not None:
+                    await connector.publish_pending_diary()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
