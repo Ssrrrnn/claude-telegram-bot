@@ -396,7 +396,7 @@ class QQConnector:
     def _qzone_context_active(self):
         try:
             last_topic = float(self.memory.get_setting(self.owner_chat_id, qq_qzone.LAST_TOPIC_AT_KEY) or 0)
-            if 0 <= time.time() - last_topic < 4 * 3600:
+            if 0 <= time.time() - last_topic < 15 * 60:
                 return True
             # Bootstrap the topic from persisted QQ turns after a rolling deploy.
             with self.memory._connect() as conn:
@@ -404,7 +404,7 @@ class QQConnector:
                     cur.execute(
                         "SELECT user_text, assistant_text FROM recent_conversation "
                         "WHERE chat_id = %s AND telegram_message_id < 0 "
-                        "AND created_at > NOW() - INTERVAL '4 hours' "
+                        "AND created_at > NOW() - INTERVAL '15 minutes' "
                         "ORDER BY id DESC LIMIT 24",
                         (self.owner_chat_id,),
                     )
