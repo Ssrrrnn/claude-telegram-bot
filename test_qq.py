@@ -411,7 +411,7 @@ class QQTests(unittest.IsolatedAsyncioTestCase):
         async def send_text(ws, sender, text):
             sent.append((sender, text))
 
-        async def send_replies(ws, sender, replies):
+        async def send_replies(ws, sender, replies, **kwargs):
             sent.extend((sender, r["text"]) for r in replies)
 
         connector._send_text = send_text

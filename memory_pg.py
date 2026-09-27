@@ -142,6 +142,33 @@ def init_db(retries: int = 12) -> None:
                         ON recent_conversation(chat_id, id DESC)
                         """
                     )
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS companion_diary (
+                            id BIGSERIAL PRIMARY KEY,
+                            chat_id BIGINT NOT NULL,
+                            text TEXT NOT NULL,
+                            source_message_id BIGINT,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            UNIQUE(chat_id, source_message_id)
+                        )
+                    """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS companion_actions (
+                            id BIGSERIAL PRIMARY KEY,
+                            chat_id BIGINT NOT NULL,
+                            action_key TEXT NOT NULL,
+                            kind TEXT NOT NULL,
+                            status TEXT NOT NULL,
+                            remote_id TEXT,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            UNIQUE(chat_id, action_key)
+                        )
+                    """)
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_companion_actions_recent
+                        ON companion_actions(chat_id, id DESC)
+                    """)
                 conn.commit()
             return
         except Exception as exc:
@@ -414,6 +441,91 @@ def delete_favorite(chat_id: int, favorite_id: int) -> bool:
             changed = cur.rowcount > 0
         conn.commit()
     return changed
+
+
+def save_diary(chat_id, source_message_id, text):
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO companion_diary(chat_id,source_message_id,text)
+                        VALUES (%s,%s,%s) ON CONFLICT (chat_id,source_message_id)
+                        DO UPDATE SET text=companion_diary.text RETURNING id""",
+                        (chat_id, source_message_id, text[:1200]))
+            row = cur.fetchone()
+        conn.commit()
+    return row["id"]
+
+
+def list_diary(chat_id, limit=12):
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,text,created_at FROM companion_diary
+                        WHERE chat_id=%s ORDER BY id DESC LIMIT %s""", (chat_id, limit))
+            return cur.fetchall()
+
+
+def get_diary(chat_id, diary_id):
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,text,created_at FROM companion_diary WHERE chat_id=%s AND id=%s",
+                        (chat_id, diary_id))
+            return cur.fetchone()
+
+
+def delete_diary(chat_id, diary_id):
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM companion_diary WHERE chat_id=%s AND id=%s", (chat_id, diary_id))
+            changed = cur.rowcount > 0
+        conn.commit()
+    return changed
+
+
+def diary_context_since(chat_id, since, limit=12):
+    """Only today's chat turns, kept private and never sent to QQ Space."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT user_text,assistant_text FROM recent_conversation
+                        WHERE chat_id=%s AND kind='chat' AND user_text IS NOT NULL
+                          AND created_at >= %s ORDER BY id DESC LIMIT %s""",
+                        (chat_id, since, limit))
+            rows = list(reversed(cur.fetchall()))
+    result = []
+    for row in rows:
+        result.extend([{"role": "user", "content": row["user_text"]},
+                       {"role": "assistant", "content": row["assistant_text"]}])
+    return result
+
+
+def begin_action(chat_id, action_key, kind):
+    """Claim a side effect before network I/O. A timeout is never auto retried."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO companion_actions(chat_id,action_key,kind,status)
+                        VALUES (%s,%s,%s,'attempting') ON CONFLICT DO NOTHING RETURNING id""",
+                        (chat_id, action_key[:120], kind[:40]))
+            claimed = cur.fetchone() is not None
+        conn.commit()
+    return claimed
+
+
+def finish_action(chat_id, action_key, status, remote_id=None):
+    if status not in ("success", "uncertain", "failed"):
+        raise ValueError("Invalid action result")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE companion_actions SET status=%s,remote_id=%s,updated_at=NOW()
+                        WHERE chat_id=%s AND action_key=%s AND status='attempting'""",
+                        (status, str(remote_id)[:120] if remote_id is not None else None,
+                         chat_id, action_key[:120]))
+        conn.commit()
+
+
+def recent_actions(chat_id, limit=8):
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT kind,status,remote_id,created_at FROM companion_actions
+                        WHERE chat_id=%s ORDER BY id DESC LIMIT %s""", (chat_id, limit))
+            return cur.fetchall()
 
 
 def _tokens(text: str) -> set[str]:

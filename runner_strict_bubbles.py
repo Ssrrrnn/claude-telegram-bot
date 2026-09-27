@@ -464,8 +464,20 @@ async def _proactive_tick(application):
                     text, strict_split_bubbles(text), as_voice=send_as_voice,
                 )
         if platform != "qq":
-            sent_as_voice = send_as_voice and await voice_output.send_voice(
-                application.bot, chat_id, text, get_setting=runner.memory_pg.get_setting)
+            voice_key = f'telegram:proactive_voice:{int(now)}'
+            begin_action = getattr(runner.memory_pg, 'begin_action', None)
+            finish_action = getattr(runner.memory_pg, 'finish_action', None)
+            voice_claimed = send_as_voice and (begin_action(
+                chat_id, voice_key, 'Telegram主动语音') if begin_action else True)
+            try:
+                sent_as_voice = bool(voice_claimed) and await voice_output.send_voice(
+                    application.bot, chat_id, text, get_setting=runner.memory_pg.get_setting)
+            except Exception:
+                if voice_claimed and finish_action:
+                    finish_action(chat_id, voice_key, 'uncertain')
+                raise
+            if voice_claimed and finish_action:
+                finish_action(chat_id, voice_key, 'success' if sent_as_voice else 'failed')
             if not sent_as_voice:
                 await _send_bubbles_to_chat(application, chat_id, text)
         if sent_as_voice and voice_mode == "auto":
@@ -494,6 +506,10 @@ async def proactive_loop(application):
     while True:
         try:
             await _proactive_tick(application)
+            chat_id = _owner_chat_id()
+            if chat_id is not None and runner.bot.is_authorized(chat_id):
+                import companion_features
+                await companion_features.auto_diary_tick(runner.memory_pg, runner.bot, chat_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

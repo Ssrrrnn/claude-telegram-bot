@@ -18,6 +18,8 @@ import qq_stickers
 import qq_status
 import qq_music
 import qq_qzone
+import qq_signature
+import companion_features
 
 OWNER_KEY = "qq_owner_uin_v1"
 PLATFORM_KEY = "last_active_platform_v1"
@@ -168,6 +170,15 @@ class QQConnector:
         self.login_failures = 0
         self.account_offline = False
 
+    def _begin_receipt(self, key, kind):
+        claim = getattr(self.memory, 'begin_action', None)
+        return claim(self.owner_chat_id, key, kind) if claim else True
+
+    def _finish_receipt(self, key, status, remote_id=None):
+        finish = getattr(self.memory, 'finish_action', None)
+        if finish:
+            finish(self.owner_chat_id, key, status, remote_id)
+
     def owner_uin(self):
         configured = os.getenv("QQ_OWNER_UIN", "").strip()
         return configured or (self.memory.get_setting(self.owner_chat_id, OWNER_KEY) or "")
@@ -227,12 +238,81 @@ class QQConnector:
             self.last_status_at = time.monotonic()
             print(f"QQ display status updated: {label}", flush=True)
 
+    async def _set_signature(self, ws, content, key):
+        if ws is not self.ws or self.account_offline or not qq_signature.valid(content):
+            raise ValueError('QQ signature unavailable or invalid')
+        if not self._begin_receipt(key, 'QQ个性签名'):
+            raise ValueError('QQ signature request was already attempted')
+        try:
+            result = await self.action(ws, 'set_self_longnick', {'longNick': content})
+            if isinstance(result, dict) and result.get('result') not in (None, 0):
+                raise RuntimeError('QQ signature rejected')
+        except Exception:
+            self._finish_receipt(key, 'uncertain')
+            raise
+        self._finish_receipt(key, 'success')
+        self.memory.set_setting(self.owner_chat_id, qq_signature.LAST_TEXT_KEY, content)
+        self.memory.set_setting(self.owner_chat_id, qq_signature.LAST_AT_KEY, str(int(time.time())))
+
+    async def _refresh_signature(self, ws):
+        if ws is not self.ws or not self.owner_uin():
+            return
+        read = lambda key: self.memory.get_setting(self.owner_chat_id, key)
+        if read(qq_signature.ENABLED_KEY) == '0' or time.time() < int(read(qq_signature.NEXT_AT_KEY) or 0):
+            return
+        now = int(time.time())
+        # Reserve the next attempt before any external request; a timeout may
+        # mean QQ accepted the previous signature.
+        self.memory.set_setting(self.owner_chat_id, qq_signature.NEXT_AT_KEY,
+                                str(now + random.randint(8, 14) * 3600))
+        previous = read(qq_signature.LAST_TEXT_KEY) or ''
+        try:
+            content = await qq_signature.generate(self.bot, self.owner_chat_id, previous)
+            await self._set_signature(ws, content, f'qq:signature:auto:{now}')
+            print('QQ profile signature updated', flush=True)
+        except Exception as exc:
+            print(f'QQ signature update skipped: {type(exc).__name__}', flush=True)
+
+    async def _handle_signature_command(self, ws, sender, message_id, parsed):
+        kind, content = parsed
+        if kind == 'status':
+            enabled = self.memory.get_setting(self.owner_chat_id, qq_signature.ENABLED_KEY) != '0'
+            current = self.memory.get_setting(self.owner_chat_id, qq_signature.LAST_TEXT_KEY) or '还没有确认设置过'
+            reply = f'自动个性签名{"开着" if enabled else "关着"}。我上次确认设的是：{current}'
+        elif kind in ('on', 'off'):
+            self.memory.set_setting(self.owner_chat_id, qq_signature.ENABLED_KEY,
+                                    '1' if kind == 'on' else '0')
+            if kind == 'on':
+                self.memory.set_setting(self.owner_chat_id, qq_signature.NEXT_AT_KEY, '0')
+            reply = '好，自动个性签名开了。' if kind == 'on' else '好，自动个性签名关了。'
+        else:
+            if kind == 'generate':
+                try:
+                    content = await qq_signature.generate(
+                        self.bot, self.owner_chat_id,
+                        self.memory.get_setting(self.owner_chat_id, qq_signature.LAST_TEXT_KEY) or '')
+                except Exception as exc:
+                    print(f'QQ signature draft unavailable: {type(exc).__name__}', flush=True)
+                    await self._send_text(ws, sender, '这句签名没写好，等会儿再试。')
+                    return
+            if not qq_signature.valid(content):
+                await self._send_text(ws, sender, '签名写成2到45字，不要链接或换行，好吗？')
+                return
+            try:
+                await self._set_signature(ws, content, f'qq:signature:request:{message_id}')
+                reply = '签名换好了：' + content
+            except Exception as exc:
+                print(f'QQ signature request uncertain: {type(exc).__name__}', flush=True)
+                reply = '这次还不能确认签名设置成功，先去资料页看一眼。'
+        await self._send_text(ws, sender, reply)
+
     async def _status_loop(self, ws):
         while True:
             try:
                 healthy = await self._check_login(ws)
                 if healthy:
                     await self._refresh_status(ws)
+                    await self._refresh_signature(ws)
             except Exception as exc:
                 print(f"QQ display status check skipped: {type(exc).__name__}", flush=True)
                 healthy = False
@@ -393,7 +473,8 @@ class QQConnector:
                 if not detail:
                     detail = await qq_qzone.generate_requested_post(self.bot, self.owner_chat_id)
                 async with self.qzone_auto_lock:
-                    await self._post_qzone(ws, detail, visibility=4)
+                    await self._post_qzone(ws, detail, visibility=4,
+                                           action_key=f'qq:qzone:{message_id}')
                 await self._send_text(ws, sender, '发到 QQ 空间了，好友可见。\n' + detail)
             except Exception as exc:
                 print(f'QQ Qzone requested post uncertain: {type(exc).__name__}', flush=True)
@@ -413,7 +494,8 @@ class QQConnector:
             self.memory.set_setting(self.owner_chat_id, qq_qzone.PENDING_KEY, '')
             try:
                 async with self.qzone_auto_lock:
-                    await self._post_qzone(ws, content, visibility=1)
+                    await self._post_qzone(ws, content, visibility=1,
+                                           action_key=f'qq:qzone:{message_id}')
                 await self._send_text(ws, sender, '发到 QQ 空间了。')
             except Exception as exc:
                 print(f'QQ Qzone post uncertain: {type(exc).__name__}', flush=True)
@@ -444,15 +526,23 @@ class QQConnector:
                               + detail + '\n\n确定的话，10分钟内回复“确认发表空间说说”；也可以说“取消发表空间说说”。')
         return True
 
-    async def _post_qzone(self, ws, content, *, visibility):
+    async def _post_qzone(self, ws, content, *, visibility, action_key=None):
         """Only a returned Qzone tid counts as confirmation of a publish."""
         if self.account_offline or ws is not self.ws:
             raise RuntimeError('QQ account is offline')
-        result = await self.action(ws, 'send_qzone_msg', {
-            'content': content, 'images': [], 'ugc_right': visibility, 'target_uins': [],
-        })
-        if not isinstance(result, dict) or not result.get('tid'):
-            raise RuntimeError('Qzone did not return a post id')
+        action_key = action_key or f'qq:qzone:auto:{uuid.uuid4().hex}'
+        if not self._begin_receipt(action_key, '空间说说'):
+            raise RuntimeError('Qzone request was already attempted')
+        try:
+            result = await self.action(ws, 'send_qzone_msg', {
+                'content': content, 'images': [], 'ugc_right': visibility, 'target_uins': [],
+            })
+            if not isinstance(result, dict) or not result.get('tid'):
+                raise RuntimeError('Qzone did not return a post id')
+        except Exception:
+            self._finish_receipt(action_key, 'uncertain')
+            raise
+        self._finish_receipt(action_key, 'success', result['tid'])
         self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_POST_KEY, str(int(time.time())))
         self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_CONTENT_KEY, content)
         return result['tid']
@@ -607,7 +697,8 @@ class QQConnector:
             print(f"QQ sticker history unavailable: {type(exc).__name__}", flush=True)
             return stickers
 
-    async def _maybe_send_sticker(self, ws, sender, user_text, replies, stickers, *, incoming_sticker=False):
+    async def _maybe_send_sticker(self, ws, sender, user_text, replies, stickers, *,
+                                  incoming_sticker=False, message_id=None):
         requested = qq_stickers.explicit_request(user_text)
         if not stickers or incoming_sticker and not requested:
             return False
@@ -634,26 +725,39 @@ class QQConnector:
         choices = random.sample(candidates, len(candidates)) if requested else [random.choice(candidates)]
         if requested:
             choices.sort(key=lambda item: item.get("kind") == "image" and item.get("sub_type") == 0)
+        key = f'qq:sticker:{message_id if message_id is not None else uuid.uuid4().hex}'
+        if not self._begin_receipt(key, 'QQ表情包'):
+            return False
         for sticker in choices[:3]:
             try:
                 await self._send_sticker(ws, sender, sticker)
+                self._finish_receipt(key, 'success')
                 self.memory.set_setting(self.owner_chat_id, qq_stickers.LAST_SENT_KEY, str(time.time()))
                 return True
             except Exception as exc:
                 print(f"QQ sticker delivery skipped: {type(exc).__name__}", flush=True)
+                # A timeout may mean QQ accepted it. Avoid sending another face.
+                self._finish_receipt(key, 'uncertain')
+                return False
         return False
 
-    async def _send_replies(self, ws, sender, replies):
-        for reply in replies:
+    async def _send_replies(self, ws, sender, replies, *, message_id=None):
+        for index, reply in enumerate(replies):
             if reply.get("type") == "record":
+                key = f'qq:voice:{message_id if message_id is not None else uuid.uuid4().hex}:{index}'
+                if not self._begin_receipt(key, 'QQ语音'):
+                    continue
                 try:
-                    await self.action(ws, "send_private_msg", {
+                    result = await self.action(ws, "send_private_msg", {
                         "user_id": int(sender),
                         "message": [{"type": "record", "data": {"file": "base64://" + reply["audio_base64"]}}],
                     })
+                    self._finish_receipt(key, 'success',
+                                         result.get('message_id') if isinstance(result, dict) else None)
                     continue
                 except Exception as exc:
                     print(f"QQ voice delivery failed: {type(exc).__name__}", flush=True)
+                    self._finish_receipt(key, 'uncertain')
                 if reply.get("fallback_text"):
                     await self._send_text(ws, sender, reply["fallback_text"])
             elif reply.get("type") == "text":
@@ -769,6 +873,32 @@ class QQConnector:
                 print(f"QQ voice transcription unavailable: {type(exc).__name__}", flush=True)
                 await self._send_text(ws, sender, "刚才那段语音没听清，打字告诉我，好吗？")
                 return
+        signature = qq_signature.command(text)
+        if signature:
+            await self._handle_signature_command(ws, sender, message_id, signature)
+            return
+        diary_id = companion_features.diary_publish_id(text)
+        if diary_id is not None:
+            if self.memory.get_setting(self.owner_chat_id, 'qq_diary_last_request_v1') == str(message_id):
+                await self._send_text(ws, sender, '这条日记发表请求已经处理过了，去空间看一下结果。')
+                return
+            row = self.memory.get_diary(self.owner_chat_id, diary_id)
+            if not row:
+                await self._send_text(ws, sender, '没找到这篇私密日记。说“查看日记”看看编号。')
+                return
+            if len(row['text']) > qq_qzone.MAX_POST_CHARS:
+                await self._send_text(ws, sender, '这篇日记超过空间正文长度，先改短再发。')
+                return
+            self.memory.set_setting(self.owner_chat_id, 'qq_diary_last_request_v1', str(message_id))
+            try:
+                async with self.qzone_auto_lock:
+                    await self._post_qzone(ws, row['text'], visibility=4,
+                                           action_key=f'qq:diary:{message_id}')
+                await self._send_text(ws, sender, '这篇日记发到 QQ 空间了，好友可见。')
+            except Exception as exc:
+                print(f'QQ diary publish uncertain: {type(exc).__name__}', flush=True)
+                await self._send_text(ws, sender, '日记这次没确认发成功，先去空间看一眼。')
+            return
         if qq_qzone.topic_mentioned(text):
             try:
                 self.memory.set_setting(self.owner_chat_id, qq_qzone.LAST_TOPIC_AT_KEY, str(int(time.time())))
@@ -797,7 +927,8 @@ class QQConnector:
                 self.memory.set_setting(self.owner_chat_id, qq_qzone.LAST_REQUEST_KEY, str(message_id))
                 try:
                     async with self.qzone_auto_lock:
-                        await self._post_qzone(ws, content, visibility=4)
+                        await self._post_qzone(ws, content, visibility=4,
+                                               action_key=f'qq:qzone:{message_id}')
                     await self._send_text(ws, sender, '发到 QQ 空间了，好友可见。\n' + content)
                 except Exception as exc:
                     print(f'QQ Qzone model action uncertain: {type(exc).__name__}', flush=True)
@@ -860,7 +991,7 @@ class QQConnector:
                 if qq_stickers.explicit_request(text) else None,
                 'quoted_context': quoted_context, 'qq_native_status': native_status,
             })
-            await self._send_replies(ws, sender, response["replies"])
+            await self._send_replies(ws, sender, response["replies"], message_id=message_id)
             if not response.get("duplicate"):
                 if game or music_card:
                     try:
@@ -880,7 +1011,7 @@ class QQConnector:
                 sent = await self._maybe_send_sticker(
                     ws, sender, text, response["replies"], stickers,
                     incoming_sticker=any(segment.get("type") == "mface" for segment in event.get("message", [])
-                                         if isinstance(segment, dict)),
+                                         if isinstance(segment, dict)), message_id=message_id,
                 )
                 if qq_stickers.explicit_request(text) and stickers and not sent:
                     await self._send_text(ws, sender, "这张表情包没发出去。我先收好，稍后再试。")
