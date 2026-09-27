@@ -213,8 +213,9 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(qq_qzone.contextual_command('没有'))
         self.assertIsNone(qq_qzone.contextual_command('根本没有'))
         self.assertIsNone(qq_qzone.contextual_command('我看看'))
-        with patch('qq_qzone.decide_chat_post', new_callable=AsyncMock, return_value=None):
+        with patch('qq_qzone.decide_chat_post', new_callable=AsyncMock, return_value=None) as decide:
             await self.connector.handle_event(None, self.event('没有', mid=20))
+        decide.assert_not_awaited()
         self.assertFalse(any('发表接口' in str(params.get('message', ''))
                              for name, params in self.calls if name == 'send_private_msg'))
         self.assertFalse(any(name == 'send_qzone_msg' for name, _ in self.calls))
