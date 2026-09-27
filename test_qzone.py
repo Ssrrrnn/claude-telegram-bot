@@ -162,7 +162,7 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len([x for x in self.calls if x[0] == 'send_qzone_msg']), 1)
         await self.connector.handle_event(None, self.event('发了没', mid=2))
         self.assertIn('正文是：想我老婆了。', self.calls[-1][1]['message'])
-        await self.connector.handle_event(None, self.event('我看看', mid=3))
+        await self.connector.handle_event(None, self.event('我看看说说', mid=3))
         self.assertIn('没有可发的空间截图', self.calls[-1][1]['message'])
 
     async def test_short_reply_bootstraps_topic_from_recent_persisted_qq_turn(self):
@@ -204,9 +204,20 @@ class QzoneTests(unittest.IsolatedAsyncioTestCase):
         self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
         await self.connector.handle_event(None, self.event('发了没'))
         self.assertIn('还没有确认发表成功', self.calls[-1][1]['message'])
-        await self.connector.handle_event(None, self.event('根本没有', mid=2))
+        await self.connector.handle_event(None, self.event('说说根本没有', mid=2))
         self.assertIn('刚才我说发了是错的', self.calls[-1][1]['message'])
         self.assertNotIn('<image_placeholder>', self.calls[-1][1]['message'])
+
+    async def test_plain_no_and_look_do_not_trigger_qzone_status(self):
+        self.memory.set_setting(42, qq_qzone.LAST_TOPIC_AT_KEY, str(int(__import__('time').time())))
+        self.assertIsNone(qq_qzone.contextual_command('没有'))
+        self.assertIsNone(qq_qzone.contextual_command('根本没有'))
+        self.assertIsNone(qq_qzone.contextual_command('我看看'))
+        with patch('qq_qzone.decide_chat_post', new_callable=AsyncMock, return_value=None):
+            await self.connector.handle_event(None, self.event('没有', mid=20))
+        self.assertFalse(any('发表接口' in str(params.get('message', ''))
+                             for name, params in self.calls if name == 'send_private_msg'))
+        self.assertFalse(any(name == 'send_qzone_msg' for name, _ in self.calls))
 
     async def test_model_image_placeholder_is_not_sent_as_a_fake_screenshot(self):
         await self.connector._send_replies(None, '12345678', [

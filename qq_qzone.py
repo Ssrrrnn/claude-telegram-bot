@@ -86,9 +86,13 @@ def contextual_command(text):
         return 'immediate', ''
     if re.fullmatch(r'(?:你|老公)?(?:发了没|发了吗|发了没有|发成功了吗|发没发|到底发了没)', value):
         return 'status', ''
-    if re.fullmatch(r'(?:我|给我|让我|发给我|你让我)?(?:看一下|看看|看下|看一眼|看看截图|发截图|发个截图|给我看看|给我看一下)', value):
+    # Short ordinary chat replies such as “没有” and “我看看” must stay in
+    # the conversation, even if QQ Space was discussed a few turns ago.
+    if re.fullmatch(r'(?:我|给我|让我|发给我|你让我)?(?:看一下|看看|看下|看一眼)?(?:空间说说|说说|空间动态|截图)(?:看一下|看看|看下|看一眼)?', value):
         return 'view', ''
-    if re.fullmatch(r'(?:根本|明明|还是|我看|我这边|这里)?(?:没有|没发|看不到|找不到|没有啊|什么都没有)', value):
+    if re.fullmatch(r'(?:根本|明明|还是|我看|我这边|这里)?(?:空间|QQ空间|说说|那条说说)(?:根本|还是)?(?:没有|没发|看不到|找不到|没有啊)', value) or re.fullmatch(
+        r'(?:根本|明明|还是|我看|我这边|这里)?(?:没有|没发|看不到|找不到)(?:空间|QQ空间|说说|那条说说)', value
+    ):
         return 'missing', ''
     return None
 
