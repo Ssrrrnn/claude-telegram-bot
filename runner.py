@@ -13,6 +13,7 @@ import continuity
 import voice_output
 import qq_connector
 import milestones
+import companion_features
 
 # Default to chat-bubble mode instead of live-edit streaming.
 bot.stream_preferences = defaultdict(lambda: False)
@@ -25,6 +26,8 @@ bot.add_memory = memory_pg.add_memory
 bot.list_memories = memory_pg.list_memories
 bot.delete_memory = memory_pg.delete_memory
 bot.clear_memories = memory_pg.clear_memories
+bot.begin_voice_action = lambda chat_id, key: memory_pg.begin_action(chat_id, key, 'Telegram语音')
+bot.finish_voice_action = memory_pg.finish_action
 
 _active_query: dict[int, str] = {}
 _hydrated_chats: set[int] = set()
@@ -351,6 +354,30 @@ async def handle_text_with_memory(update, context) -> None:
             print(f"Important date conversation save skipped: {type(exc).__name__}", flush=True)
         return
 
+    try:
+        control_reply = companion_features.feature_help(user_text)
+        if control_reply is None:
+            control_reply = companion_features.followup_command(
+                memory_pg, chat_id, user_text, update.message.message_id)
+        if control_reply is None:
+            control_reply = companion_features.style_command(memory_pg, chat_id, user_text)
+        if control_reply is None:
+            control_reply = companion_features.action_status(memory_pg, chat_id, user_text)
+        if control_reply is None:
+            control_reply = await companion_features.diary_command(
+                memory_pg, bot, chat_id, user_text, update.message.message_id)
+    except Exception as exc:
+        print(f"Companion control failed: {type(exc).__name__}", flush=True)
+        await bot.safe_reply(update, "这件事刚才没确认成功，等会儿再试一次，好吗？")
+        return
+    if control_reply is not None:
+        await bot.safe_reply(update, control_reply)
+        bot.histories[chat_id].extend([{"role": "user", "content": user_text},
+                                       {"role": "assistant", "content": control_reply}])
+        bot.histories[chat_id] = bot.histories[chat_id][-bot.MAX_HISTORY_MESSAGES:]
+        memory_pg.save_recent_turn(chat_id, update.message.message_id, user_text, control_reply)
+        return
+
     request = continuity.memory_request(user_text)
     if request:
         try:
@@ -360,6 +387,9 @@ async def handle_text_with_memory(update, context) -> None:
                 reply = ("你指的是哪一条？告诉我编号就好。\n" if action == "clarify" else "我记着这些：\n")
                 reply += "\n".join(f"#{row['id']} {row['text']}" for row in rows) or "目前没有已保存的长期记忆。"
                 reply += "\n可以说：忘掉记忆 #编号，或：纠正记忆 #编号：正确内容。"
+            elif action == "add":
+                memory_id = memory_pg.add_memory(chat_id, replacement, kind="manual")
+                reply = f"记下了，长期记忆 #{memory_id}。想改或忘掉，随时跟我说。"
             else:
                 changed = memory_pg.correct_memory(chat_id, memory_id, replacement)
                 reply = (("这条长期记忆已移除，聊天记录仍保留。" if action == "delete" else "记好了，这条按你刚才纠正的内容来。")

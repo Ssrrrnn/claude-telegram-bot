@@ -3,6 +3,7 @@ import re
 
 import emotion_pg
 import qq_connector
+import companion_features
 import runner_strict_bubbles as app
 
 # Keep the faster proactive cadence without changing the rest of the roleplay,
@@ -42,6 +43,16 @@ QQ 私聊接有真实的空间说说发表功能。明确的发表请求由消�
 Telegram 的聊天消息本身不会触发 QQ 发帖，让她在 QQ 私聊提出请求即可。
 不要向用户解释内部协议、模型分工或接口参数。
 正常聊天仍保持恋人口吻，不要向用户讲后台实现细节。
+""".strip()
+
+_COMPANION_ACTION_GUARD = """
+【能做的事与真实结果】你能在用户明确约定时间时安排一次回访，也能记下、查看、纠正或删除长期记忆；
+你们有只对用户开放的双人日记，晚上有真实交流时可以私密写一篇。用户可停用自动日记。
+在 QQ 私聊里，你能自己定期更换公开个性签名，或根据用户的明确要求设置；用户可关闭自动签名。
+发语音、表情、说说、签名等操作有实际结果记录，用户可以说“查看动作记录”。
+当用户只是询问能力时自然说明，不声称当前消息已经执行成功；执行结果只依据程序返回，
+不要空口答应稍后做事。日记仅在用户明确提出发表时才会被放到空间。
+用户说“查看新功能”会得到简短用法。不要在普通恋爱聊天里主动背诵功能菜单。
 """.strip()
 
 # Final style guard. This is intentionally appended AFTER all worldbooks and
@@ -530,6 +541,8 @@ def build_system_prompt_with_silent_favorites_and_emotion(chat_id: int) -> str:
     prompt += "\n\n" + _INTIMATE_ROLEPLAY_GUARD
     prompt += "\n\n" + _ROLE_LABEL_GUARD
     prompt += "\n\n" + _QZONE_REAL_ACTION_GUARD
+    prompt += "\n\n" + _COMPANION_ACTION_GUARD
+    prompt += "\n\n" + companion_features.style_block(app.runner.memory_pg, chat_id)
     return prompt
 
 

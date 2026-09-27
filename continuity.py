@@ -133,6 +133,27 @@ def due_followup(state, now):
     return min(eligible, key=lambda x: x["due_at"]) if eligible else None
 
 
+def schedule_requested(db, chat_id, message_id, title, due_at):
+    """Put an owner requested follow-up into the existing proactive queue."""
+    import uuid
+    scheduled = None
+    def mutate(state):
+        nonlocal scheduled
+        if any(item.get("source_message_id") == message_id and item.get("category") == "requested"
+               for item in state["threads"]):
+            return state
+        scheduled = {"id": uuid.uuid4().hex[:12], "title": title[:80],
+                     "purpose": "按约定时间自然问用户这件事的进展，不编造结果", "category": "requested",
+                     "subject": "user", "realm": "real", "source_message_id": message_id,
+                     "evidence": title[:80], "created_at": time.time(), "due_at": due_at,
+                     "expires_at": due_at + 2 * 86400, "status": "open", "contacted_at": None}
+        state["threads"].append(scheduled)
+        state["threads"] = state["threads"][-40:]
+        return state
+    db.mutate_continuity(chat_id, mutate)
+    return scheduled
+
+
 def claim_followup(db, chat_id, thread_id):
     claimed = False
     def mutate(state):
@@ -164,6 +185,9 @@ def memory_request(text):
     compact = text.strip().rstrip("。？！!?")
     if compact in ("你记得我什么", "你都记得我什么", "查看记忆"):
         return ("list", None, None)
+    match = re.fullmatch(r"(?:记住|请记住|帮我记住)[：:]\s*(.{1,900})", compact)
+    if match:
+        return ("add", None, match.group(1).strip())
     match = re.fullmatch(r"(?:忘掉|删除)(?:记忆)?\s*#?(\d+)", compact)
     if match:
         return ("delete", int(match[1]), None)

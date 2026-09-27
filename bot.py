@@ -504,11 +504,36 @@ async def generate_and_send(
                                user_text=user_text if isinstance(user_text, str) else "",
                                reply_text=answer,
                            ))
-            sent_as_voice = (use_voice or spontaneous) and await voice_output.send_voice(
-                context.bot, chat_id, answer,
-                reply_to_message_id=update.message.message_id,
-                get_setting=get_setting,
-            )
+            voice_requested = use_voice or spontaneous
+            voice_key = f'telegram:voice:{update.message.message_id}'
+            record_voice = (voice_requested and getattr(update.message, 'source_platform', None) != 'qq'
+                            and callable(globals().get('begin_voice_action')))
+            if record_voice:
+                try:
+                    record_voice = begin_voice_action(chat_id, voice_key)
+                    if not record_voice:
+                        voice_requested = False
+                except Exception as exc:
+                    print(f'Telegram voice receipt unavailable: {type(exc).__name__}', flush=True)
+                    record_voice = False
+            try:
+                sent_as_voice = voice_requested and await voice_output.send_voice(
+                    context.bot, chat_id, answer,
+                    reply_to_message_id=update.message.message_id,
+                    get_setting=get_setting,
+                )
+            except Exception:
+                if record_voice:
+                    try:
+                        finish_voice_action(chat_id, voice_key, 'uncertain')
+                    except Exception:
+                        pass
+                raise
+            if record_voice:
+                try:
+                    finish_voice_action(chat_id, voice_key, 'success' if sent_as_voice else 'failed')
+                except Exception as exc:
+                    print(f'Telegram voice receipt save skipped: {type(exc).__name__}', flush=True)
             if sent_as_voice and voice_mode == "auto":
                 voice_output.record_auto_voice(set_setting, chat_id)
             if not sent_as_voice:
