@@ -547,6 +547,51 @@ class QQConnector:
         self.memory.set_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_CONTENT_KEY, content)
         return result['tid']
 
+    async def _publish_diary(self, ws, diary_id, *, allow_private=False):
+        """Publish a claimed diary once; a timeout requires human verification."""
+        if ws is None or ws is not self.ws or self.account_offline or not self.owner_uin():
+            raise RuntimeError('QQ account is offline')
+        async with self.qzone_auto_lock:
+            row = self.memory.claim_diary_publish(
+                self.owner_chat_id, diary_id, allow_private=allow_private)
+            if not row:
+                return None
+            try:
+                tid = await self._post_qzone(
+                    ws, row['text'], visibility=4, action_key=f'qq:diary:{diary_id}')
+            except Exception:
+                self.memory.finish_diary_publish(self.owner_chat_id, diary_id, 'uncertain')
+                raise
+            self.memory.finish_diary_publish(self.owner_chat_id, diary_id, 'published', tid)
+            return tid
+
+    async def publish_pending_diary(self):
+        """Drain one page per scheduler tick while QQ is connected."""
+        ws = self.ws
+        if ws is None or self.account_offline or not self.owner_uin():
+            return
+        row = self.memory.next_pending_diary(self.owner_chat_id)
+        if not row:
+            return
+        try:
+            tid = await self._publish_diary(ws, row['id'])
+        except Exception as exc:
+            print(f'QQ diary publish unconfirmed: {type(exc).__name__}', flush=True)
+            if ws is self.ws and not self.account_offline:
+                try:
+                    await self._send_text(ws, self.owner_uin(),
+                        f'日记 #{row["id"]} 发空间的结果没确认，先去空间核对，避免重复发。')
+                except Exception:
+                    pass
+            return
+        if tid and ws is self.ws:
+            print(f'QQ diary published: id={row["id"]}', flush=True)
+            try:
+                await self._send_text(ws, self.owner_uin(),
+                                      f'日记 #{row["id"]} 发到 QQ 空间了，好友可见。')
+            except Exception as exc:
+                print(f'QQ diary confirmation unavailable: {type(exc).__name__}', flush=True)
+
     async def _qzone_auto_tick(self, ws, *, cue=False):
         if ws is not self.ws or not self.owner_uin():
             return
@@ -879,22 +924,23 @@ class QQConnector:
             return
         diary_id = companion_features.diary_publish_id(text)
         if diary_id is not None:
-            if self.memory.get_setting(self.owner_chat_id, 'qq_diary_last_request_v1') == str(message_id):
-                await self._send_text(ws, sender, '这条日记发表请求已经处理过了，去空间看一下结果。')
-                return
             row = self.memory.get_diary(self.owner_chat_id, diary_id)
             if not row:
-                await self._send_text(ws, sender, '没找到这篇私密日记。说“查看日记”看看编号。')
+                await self._send_text(ws, sender, '没找到这篇日记。说“查看日记”看看编号。')
+                return
+            if row.get('publish_status') == 'published':
+                await self._send_text(ws, sender, '这篇已经发到 QQ 空间了，好友可见。')
+                return
+            if row.get('publish_status') in ('attempting', 'uncertain'):
+                await self._send_text(ws, sender, '这篇发表结果还没确认，先去空间核对一下，避免重复发。')
                 return
             if len(row['text']) > qq_qzone.MAX_POST_CHARS:
                 await self._send_text(ws, sender, '这篇日记超过空间正文长度，先改短再发。')
                 return
-            self.memory.set_setting(self.owner_chat_id, 'qq_diary_last_request_v1', str(message_id))
             try:
-                async with self.qzone_auto_lock:
-                    await self._post_qzone(ws, row['text'], visibility=4,
-                                           action_key=f'qq:diary:{message_id}')
-                await self._send_text(ws, sender, '这篇日记发到 QQ 空间了，好友可见。')
+                tid = await self._publish_diary(ws, diary_id, allow_private=True)
+                await self._send_text(ws, sender, '这篇日记发到 QQ 空间了，好友可见。' if tid
+                                      else '这篇已经在发表中，先去空间看一下结果。')
             except Exception as exc:
                 print(f'QQ diary publish uncertain: {type(exc).__name__}', flush=True)
                 await self._send_text(ws, sender, '日记这次没确认发成功，先去空间看一眼。')

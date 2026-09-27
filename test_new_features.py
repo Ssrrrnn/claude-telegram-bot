@@ -41,11 +41,25 @@ class Memory:
         if (chat, mid) in self.diary: return self.diary[chat, mid]['id']
         idx = self.next_diary
         self.next_diary += 1
-        self.diary[chat, mid] = {'id': idx, 'text': text, 'created_at': datetime.now(LOCAL)}
+        self.diary[chat, mid] = {'id': idx, 'text': text, 'created_at': datetime.now(LOCAL),
+                                 'publish_status': 'pending', 'qzone_tid': None}
         return idx
     def get_diary(self, chat, idx):
         return next((v for (c, _), v in self.diary.items() if c == chat and v['id'] == idx), None)
     def list_diary(self, chat): return [v for (c, _), v in self.diary.items() if c == chat]
+    def next_pending_diary(self, chat):
+        return next((v for (c, _), v in self.diary.items()
+                     if c == chat and v['publish_status'] == 'pending'), None)
+    def claim_diary_publish(self, chat, idx, *, allow_private=False):
+        row = self.get_diary(chat, idx)
+        if row and row['publish_status'] in (('pending', 'private') if allow_private else ('pending',)):
+            row['publish_status'] = 'attempting'
+            return row
+        return None
+    def finish_diary_publish(self, chat, idx, status, tid=None):
+        row = self.get_diary(chat, idx)
+        if row['publish_status'] == 'attempting':
+            row['publish_status'], row['qzone_tid'] = status, tid
     def delete_diary(self, chat, idx):
         return self.diary.pop(next(((c, m) for (c, m), v in self.diary.items()
                                     if c == chat and v['id'] == idx), None), None) is not None
@@ -74,16 +88,19 @@ class FeaturesTests(unittest.IsolatedAsyncioTestCase):
             self.memory, 42, '取消回访 #' + item['id'], 101, now=self.now))
         self.assertIsNone(continuity.due_followup(self.memory.state, item['due_at']))
 
-    async def test_manual_diary_stays_private_and_can_be_removed(self):
+    async def test_manual_diary_queues_for_qzone_and_can_be_removed_before_publish(self):
         bot = SimpleNamespace(ask_claude=AsyncMock(return_value='今天你说工作很累，我记住了这句。先不用撑着，想说话我就在这里陪你。'),
                               current_model=lambda chat: 'test')
         reply = await features.diary_command(self.memory, bot, 42, '写一篇双人日记', 202)
-        self.assertIn('私密日记 #1', reply)
+        self.assertIn('等 QQ 空间确认发表', reply)
+        self.assertEqual(self.memory.get_diary(42, 1)['publish_status'], 'pending')
         self.assertIn('今天你说工作很累', await features.diary_command(
             self.memory, bot, 42, '看日记 #1', 203))
-        self.assertIn('QQ 私聊', await features.diary_command(
+        self.assertIn('自动发到空间', await features.diary_command(
             self.memory, bot, 42, '发日记 #1 到空间', 204))
         self.assertEqual(len(self.memory.diary), 1)
+        self.assertIn('待发空间', await features.diary_command(
+            self.memory, bot, 42, '查看日记', 205))
         self.assertIn('删掉', await features.diary_command(self.memory, bot, 42, '删除日记 #1', 205))
 
     async def test_automatic_diary_only_once_on_a_day_with_conversation(self):
@@ -95,7 +112,9 @@ class FeaturesTests(unittest.IsolatedAsyncioTestCase):
         await features.auto_diary_tick(self.memory, bot, 42, now=evening)
         await features.auto_diary_tick(self.memory, bot, 42, now=evening + timedelta(minutes=5))
         self.assertEqual(len(self.memory.diary), 1)
+        self.assertEqual(self.memory.get_diary(42, 1)['publish_status'], 'pending')
         bot.ask_claude.assert_awaited_once()
+        self.assertIn('好友可见 QQ 空间', bot.ask_claude.call_args.args[1][-1]['content'])
 
     async def test_signature_and_post_receipts_require_real_action_result(self):
         self.memory.set_setting(42, 'qq_owner_uin_v1', '12345678')
@@ -120,7 +139,7 @@ class FeaturesTests(unittest.IsolatedAsyncioTestCase):
             await connector._post_qzone(ws, '有些话只想留给你', visibility=4, action_key='qq:qzone:1')
         self.assertEqual(len([name for name, _ in calls if name == 'send_qzone_msg']), 1)
 
-    async def test_owner_can_publish_one_private_diary_page_to_qzone(self):
+    async def test_owner_can_publish_one_diary_page_to_qzone(self):
         self.memory.set_setting(42, 'qq_owner_uin_v1', '12345678')
         self.memory.save_diary(42, -20260927, '这段话先收进日记。')
         bot = SimpleNamespace(current_model=lambda chat: 'test')
@@ -140,8 +159,40 @@ class FeaturesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([params['content'] for name, params in calls
                           if name == 'send_qzone_msg'], ['这段话先收进日记。'])
         self.assertIn('发到 QQ 空间了', calls[-1][1]['message'])
+        self.assertEqual(self.memory.get_diary(42, 1)['qzone_tid'], 'diary-post')
         await connector.handle_event(ws, event)
         self.assertEqual(len([name for name, _ in calls if name == 'send_qzone_msg']), 1)
+
+    async def test_pending_diary_publishes_once_and_offline_waits(self):
+        self.memory.set_setting(42, 'qq_owner_uin_v1', '12345678')
+        self.memory.save_diary(42, -20260927, '今天心里装着一句没有说出口的话。')
+        connector = QQConnector(owner_chat_id=42, pair_code='x'*20,
+            expected_self_uin='88888888', handler=AsyncMock(),
+            bot=SimpleNamespace(), memory=self.memory)
+        connector.action = AsyncMock(side_effect=lambda ws, name, params:
+                                      {'tid': 'confirmed-post'} if name == 'send_qzone_msg' else {})
+        await connector.publish_pending_diary()
+        self.assertEqual(self.memory.get_diary(42, 1)['publish_status'], 'pending')
+        connector.ws = object()
+        await connector.publish_pending_diary()
+        await connector.publish_pending_diary()
+        self.assertEqual(self.memory.get_diary(42, 1)['publish_status'], 'published')
+        self.assertEqual(len([c for c in connector.action.call_args_list
+                              if c.args[1] == 'send_qzone_msg']), 1)
+
+    async def test_uncertain_diary_post_does_not_retry(self):
+        self.memory.set_setting(42, 'qq_owner_uin_v1', '12345678')
+        self.memory.save_diary(42, -20260927, '今天心里装着一句没有说出口的话。')
+        connector = QQConnector(owner_chat_id=42, pair_code='x'*20,
+            expected_self_uin='88888888', handler=AsyncMock(),
+            bot=SimpleNamespace(), memory=self.memory)
+        connector.ws = object()
+        connector.action = AsyncMock(side_effect=TimeoutError())
+        await connector.publish_pending_diary()
+        await connector.publish_pending_diary()
+        self.assertEqual(self.memory.get_diary(42, 1)['publish_status'], 'uncertain')
+        self.assertEqual(len([c for c in connector.action.call_args_list
+                              if c.args[1] == 'send_qzone_msg']), 1)
 
     async def test_auto_signature_updates_once_and_never_uses_private_history(self):
         self.memory.set_setting(42, 'qq_owner_uin_v1', '12345678')
