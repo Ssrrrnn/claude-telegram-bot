@@ -69,6 +69,13 @@ def topic_mentioned(text):
                           r'|(?:发|发表|写|发布|放到|放进).{0,8}(?:空间|动态)', text))
 
 
+def maybe_publish_intent(text):
+    """Only publication language merits a second model action decision."""
+    return bool(re.search(r'(?:发|发表|发布|放到|放进|写).{0,16}(?:空间|说说|动态)'
+                          r'|(?:空间|说说|动态).{0,16}(?:发|发表|发布|放)', text)
+                or re.search(r'(?:发出去|发表出去|发一条|发条说说)', text))
+
+
 def contextual_command(text):
     """Handle short follow-ups only when the conversation is about QQ Space."""
     value = text.strip(' 。！!？?，,')

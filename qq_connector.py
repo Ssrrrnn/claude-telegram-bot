@@ -434,7 +434,7 @@ class QQConnector:
             last_content = self.memory.get_setting(self.owner_chat_id, qq_qzone.AUTO_LAST_CONTENT_KEY) or ''
             if last_at:
                 date = datetime.fromtimestamp(last_at, qq_qzone.BEIJING).strftime('%m月%d日 %H:%M')
-                message = (f'发表接口上次确认成功是在{date}。'
+                message = (f'我上次确认发成功是在{date}。'
                            + (f'正文是：{last_content}' if last_content else '')
                            + ('我没有可发的空间截图；如果你那里看不到，我会按实际情况排查。'
                               if kind != 'status' else ''))
@@ -959,7 +959,7 @@ class QQConnector:
         # Natural language that the fixed command parser misses still reaches
         # a model decision. A publish is executed here, before any chat reply.
         # Never report success until OneBot returns a post id.
-        if qzone_context:
+        if qzone_context and qq_qzone.maybe_publish_intent(text):
             try:
                 content = await qq_qzone.decide_chat_post(
                     self.bot, self.owner_chat_id, text, recent_topic=qzone_context)
