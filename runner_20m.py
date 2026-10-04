@@ -580,7 +580,11 @@ app.runner.handle_text_with_memory = handle_text_with_emotion
 app.runner.bot.handle_text = handle_text_with_emotion
 
 async def handle_text_with_platform(update, context) -> None:
-    if update.message and update.message.text and app.runner.bot.is_authorized(update.effective_chat.id):
+    # iOS reads proactive messages from shared history. Keep QQ/Telegram as the
+    # background delivery channel until the native app has a supported push path.
+    if (update.message and update.message.text
+            and getattr(update.message, 'source_platform', None) != 'ios'
+            and app.runner.bot.is_authorized(update.effective_chat.id)):
         platform = "qq" if getattr(update.message, "source_platform", None) == "qq" else "telegram"
         try:
             app.runner.memory_pg.set_setting(update.effective_chat.id, qq_connector.PLATFORM_KEY, platform)
@@ -606,6 +610,13 @@ async def fixed_post_init(application) -> None:
         print(f"Emotion state init failed; fallback persona only: {exc!r}", flush=True)
 
     await app._original_post_init(application)
+
+    try:
+        import ios_api
+        await ios_api.start(application, handler=app.runner.handle_text_with_memory,
+                            bot=app.runner.bot, memory=app.runner.memory_pg)
+    except Exception as exc:
+        print(f'iOS API unavailable: {type(exc).__name__}', flush=True)
 
     try:
         await qq_connector.start(
