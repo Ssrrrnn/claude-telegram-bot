@@ -274,6 +274,8 @@ async def start(application, *, handler, bot, memory):
         raise
     application.bot_data['ios_api_runner'] = runner
     print('Owner-only iOS API enabled', flush=True)
+    if phone is not None:
+        await phone_bridge.probe_provider(bot, owner)
 
 
 async def stop(application):

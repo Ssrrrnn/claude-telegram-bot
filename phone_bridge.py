@@ -229,6 +229,29 @@ def end_turn(token):
     _turn.reset(token)
 
 
+async def probe_provider(bot, chat_id):
+    """One bounded startup protocol check; never sends chat or executes tools."""
+    import httpx
+    probe = tool('phone_bridge_probe', 'Protocol diagnostic. Return empty arguments; no side effects.', {})
+    request = {'model': bot.current_model(chat_id), 'messages': [
+        {'role': 'system', 'content': 'This is a tool protocol check. Call phone_bridge_probe with empty arguments. Do not write prose.'},
+        {'role': 'user', 'content': 'Run the protocol check.'}],
+        'tools': [probe], 'tool_choice': 'auto', 'max_tokens': 128, 'stream': False}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(f'{bot.LLMHUB_BASE_URL}/chat/completions', headers=bot.api_headers(), json=request)
+        if response.status_code >= 400:
+            status = 'unsupported' if response.status_code in (400, 422) else 'unconfirmed'
+        else:
+            message = (response.json().get('choices') or [{}])[0].get('message') or {}
+            calls = message.get('tool_calls') or []
+            status = 'supported' if any(isinstance(call, dict) and (call.get('function') or {}).get('name') == 'phone_bridge_probe' for call in calls) else 'unconfirmed'
+    except Exception:
+        status = 'unconfirmed'
+    print(f'Phone provider structured tools: {status}', flush=True)
+    return status
+
+
 def tool(name, description, properties, required=()):
     return {'type': 'function', 'function': {'name': name, 'description': description,
             'parameters': {'type': 'object', 'properties': properties, 'required': list(required), 'additionalProperties': False}}}

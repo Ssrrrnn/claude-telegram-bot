@@ -213,3 +213,18 @@ class PhoneTests(unittest.IsolatedAsyncioTestCase):
             text = await bridge.ask_with_tools(bot, {'messages': [{'role': 'system', 'content': '人格'}]}, 123)
         self.assertEqual(text, '这次没有保存。')
         self.assertFalse(self.phone.records)
+
+    async def test_protocol_probe_does_not_execute_or_store_model_output(self):
+        import httpx
+        calls = []
+        def handler(request):
+            payload = json.loads(request.content); calls.append(payload)
+            self.assertNotIn('自己的记录', request.content.decode())
+            return httpx.Response(200, json={'choices': [{'message': {'tool_calls': [{'function': {'name': 'phone_bridge_probe', 'arguments': '{}'}}]}}]})
+        original_client = httpx.AsyncClient
+        bot = SimpleNamespace(current_model=lambda owner: 'test', LLMHUB_BASE_URL='https://model.invalid', api_headers=lambda: {})
+        with patch('httpx.AsyncClient', side_effect=lambda **kw: original_client(transport=httpx.MockTransport(handler), **kw)):
+            self.assertEqual(await bridge.probe_provider(bot, 123), 'supported')
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(self.phone.actions)
+        self.assertFalse(self.phone.records)
