@@ -6,6 +6,7 @@ writes complete only after the authorized phone reports an EventKit receipt.
 import asyncio
 import contextvars
 import json
+import math
 import re
 import time
 from datetime import datetime, timedelta
@@ -71,11 +72,23 @@ def normalize_entry(data, actor):
 
 
 def normalize_snapshot(data):
-    if not isinstance(data, dict) or set(data) - {'device_id', 'battery', 'calendar_read', 'calendar_write', 'events'}:
+    if not isinstance(data, dict) or set(data) - {'device_id', 'battery', 'calendar_read', 'calendar_write', 'events', 'location_read', 'location'}:
         raise BridgeError('设备格式不正确。')
     value = {'device_id': identifier(data.get('device_id', '')), 'battery': None,
              'calendar_read': data.get('calendar_read') is True,
-             'calendar_write': data.get('calendar_write') is True, 'events': []}
+             'calendar_write': data.get('calendar_write') is True, 'events': [],
+             'location_read': data.get('location_read') is True, 'location': None}
+    location = data.get('location')
+    if value['location_read'] and location is not None:
+        if not isinstance(location, dict) or set(location) != {'latitude', 'longitude', 'accuracy', 'sampled_at'}:
+            raise BridgeError('定位数据不正确。')
+        for field, low, high in [('latitude', -90, 90), ('longitude', -180, 180), ('accuracy', 0, 100000)]:
+            v = location[field]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not low <= v <= high:
+                raise BridgeError('定位数值不正确。')
+        sampled = timestamp(location['sampled_at'])
+        if not -300 <= time.time() - sampled.timestamp() <= 86400: raise BridgeError('定位时间不正确。')
+        value['location'] = {**location, 'sampled_at': sampled.isoformat()}
     battery = data.get('battery')
     if battery is not None:
         if not isinstance(battery, dict) or set(battery) - {'level', 'charging', 'low_power'}:
@@ -137,7 +150,7 @@ class PhoneStore:
     def entries(self, begin, end):
         with self.memory._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute('SELECT data FROM companion_shared_entries WHERE chat_id=%s AND day>=%s AND day<=%s ORDER BY day,id LIMIT 500',
+                cur.execute('SELECT data FROM companion_shared_entries WHERE chat_id=%s AND day>=%s AND day<=%s ORDER BY day,updated_at,id LIMIT 500',
                             (self.owner, begin, end))
                 return [row['data'] for row in cur.fetchall()]
 
@@ -188,6 +201,17 @@ class PhoneStore:
             with conn.cursor() as cur:
                 cur.execute("SELECT data FROM companion_phone_actions WHERE chat_id=%s AND device_id=%s AND status='queued' ORDER BY created_at LIMIT 10", (self.owner, device_id))
                 return [row['data'] for row in cur.fetchall()]
+
+    def queue_location(self, action, snapshot):
+        with self.memory._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT device_id,data FROM companion_phone_context WHERE chat_id=%s FOR UPDATE', (self.owner,))
+                current = cur.fetchone()
+                if not current or str(current['device_id']) != snapshot['device_id'] or not current['data'].get('location_read'):
+                    raise BridgeError('手机没有授权定位。')
+                cur.execute('INSERT INTO companion_phone_actions(chat_id,id,device_id,data) VALUES(%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING',
+                            (self.owner, action['id'], snapshot['device_id'], json.dumps(action, ensure_ascii=False)))
+            conn.commit()
 
     def result(self, action_id):
         with self.memory._connect() as conn:
@@ -258,6 +282,7 @@ def tool(name, description, properties, required=()):
 
 
 TOOLS = [
+    tool('read_current_location', '真正请求已授权的手机采样当前位置，附时间与精度。App需在前台；离线仅能返回最后位置，不能谎称实时定位。', {}),
     tool('read_phone_context', '读取用户已授权的真实手机快照：电量、充电状态及所选日历未来30天日程。快照有时间，旧快照不能当实时。未授权的信息不能猜。', {}),
     tool('read_shared_calendar', '查看两人的共享日历记录，包括双方心情、小记和日程。与聊天发送无关。',
          {'from_day': {'type': 'string'}, 'to_day': {'type': 'string'}}, ('from_day', 'to_day')),
@@ -282,11 +307,34 @@ read_phone_context带采样时间；过期或离线要直说最后一次同步�
 
 
 async def execute(name, args, store, turn):
+    import companion_agent
+    if name in {item['function']['name'] for item in companion_agent.TOOLS}:
+        return await companion_agent.execute(name, args, turn)
     if name not in {item['function']['name'] for item in TOOLS} or not isinstance(args, dict):
         raise BridgeError('没有这个调用权限。')
     schema = next(item['function']['parameters'] for item in TOOLS if item['function']['name'] == name)
     if set(args) - set(schema['properties']) or set(schema['required']) - set(args):
         raise BridgeError('工具参数不完整。')
+    if name == 'read_current_location':
+        snapshot = await asyncio.to_thread(store.snapshot)
+        if not snapshot or not snapshot.get('location_read'):
+            return {'status': 'unavailable', 'message': '用户没有授权定位，不能读取。'}
+        if time.time() - snapshot['received_at'] >= 90:
+            return {'status': 'last_known', 'location': snapshot.get('location'), 'message': '手机离线，这是最后采样的位置，不能当成现在。'}
+        action_id = str(uuid5(NAMESPACE_URL, turn['key'] + ':location'))
+        action = {'id': action_id, 'kind': 'refresh_location', 'title': '采样位置', 'start': '', 'end': ''}
+        await asyncio.to_thread(store.queue_location, action, snapshot)
+        deadline = time.monotonic() + 24
+        while time.monotonic() < deadline:
+            result = await asyncio.to_thread(store.result, action_id)
+            if result and result['status'] != 'queued':
+                latest = await asyncio.to_thread(store.snapshot)
+                location = latest.get('location') if latest and latest.get('location_read') else None
+                fresh = location and time.time() - timestamp(location['sampled_at']).timestamp() < 120
+                return {'status': 'current' if result['status'] == 'done' and fresh else 'unavailable', 'location': location,
+                        'message': '手机已采样，精度以accuracy米为准。' if result['status'] == 'done' and fresh else '没有取得新的定位。'}
+            await asyncio.sleep(0.5)
+        return {'status': 'waiting', 'message': '未取得实时位置，请保持小家前台并检查定位权限。'}
     if name == 'read_phone_context':
         snapshot = await asyncio.to_thread(store.snapshot)
         if not snapshot:
@@ -343,9 +391,13 @@ async def execute(name, args, store, turn):
 
 async def ask_with_tools(bot, payload, chat_id):
     import httpx
+    import companion_agent
     turn = _turn.get() or {'key': 'generation:' + str(uuid4()), 'results': {}}
     transcript = [dict(item) for item in payload['messages']]
     transcript[0] = {**transcript[0], 'content': transcript[0]['content'] + '\n\n' + GUARD}
+    activity_tools = companion_agent.TOOLS if companion_agent._store is not None else []
+    if activity_tools:
+        transcript[0]['content'] += '\n【自己的生活】你可以真正读共读书、保存独立进度和随笔、查询百科、查看活动。必须调用工具才会保存。读书先read_next_book_page，读完再finish_book_page。手机定位调用read_current_location，未授权/离线不猜。自主唤醒会自己写心情与计划，聊天无需每轮重复。'
     now = datetime.now(TZ)
     try:
         recent = await asyncio.to_thread(_store.entries, (now - timedelta(days=6)).strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'))
@@ -355,7 +407,7 @@ async def ask_with_tools(bot, payload, chat_id):
         pass
     async with httpx.AsyncClient(timeout=bot.REQUEST_TIMEOUT_SECONDS) as client:
         for attempt in range(5):
-            request = {**payload, 'messages': transcript, 'stream': False, 'tools': TOOLS, 'tool_choice': 'auto' if attempt < 4 else 'none'}
+            request = {**payload, 'messages': transcript, 'stream': False, 'tools': TOOLS + activity_tools, 'tool_choice': 'auto' if attempt < 4 else 'none'}
             response = await client.post(f'{bot.LLMHUB_BASE_URL}/chat/completions', headers=bot.api_headers(), json=request)
             if response.status_code in (400, 422) and attempt == 0:
                 # Some relays don't support tools. Do not break ordinary chat or

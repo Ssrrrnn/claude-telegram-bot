@@ -153,7 +153,7 @@ class Gateway:
                 raise
 
 
-def create_web_app(gateway, phone=None):
+def create_web_app(gateway, phone=None, agent=None, heartbeat=None):
     from aiohttp import web
     import phone_bridge
 
@@ -232,6 +232,32 @@ def create_web_app(gateway, phone=None):
         result = {'success': data.get('success') is True, 'event_id': phone_bridge.short(data.get('event_id', ''), 500), 'message': phone_bridge.short(data.get('message', ''), 300)}
         return web.json_response({'result': await asyncio.to_thread(phone_store().acknowledge, device, identifier, result)})
 
+    def agent_store():
+        if agent is None: raise APIError(503, '自主活动暂不可用。')
+        return agent
+
+    async def books(request):
+        import companion_agent
+        if request.method == 'POST':
+            chunk = companion_agent.book_chunk(await request.json())
+            return web.json_response(await asyncio.to_thread(agent_store().put_book, chunk))
+        return web.json_response({'books': await asyncio.to_thread(agent_store().books)})
+
+    async def delete_book(request):
+        return web.json_response({'removed': await asyncio.to_thread(agent_store().delete_book, phone_bridge.identifier(request.match_info['id']))})
+
+    async def activity(request):
+        day = phone_bridge.day(request.query.get('day', ''))
+        state = await asyncio.to_thread(agent_store().state)
+        return web.json_response({'state': state, 'activities': await asyncio.to_thread(agent_store().activities, day)})
+
+    async def heartbeat_config(request):
+        data = await request.json()
+        if not isinstance(data, dict) or set(data) != {'enabled'} or not isinstance(data['enabled'], bool):
+            raise APIError(400, '自主活动设置不正确。')
+        await asyncio.to_thread(agent_store().configure, data['enabled'])
+        return web.json_response({'ok': True})
+
     app = web.Application(middlewares=[protection], client_max_size=128_000)
     app.router.add_get('/health', health)
     app.router.add_get('/v1/history', history)
@@ -243,6 +269,11 @@ def create_web_app(gateway, phone=None):
     app.router.add_post('/v1/phone/context', phone_context)
     app.router.add_get('/v1/phone/actions', phone_actions)
     app.router.add_post('/v1/phone/actions/{id}/receipt', phone_receipt)
+    app.router.add_get('/v1/books', books)
+    app.router.add_post('/v1/books', books)
+    app.router.add_delete('/v1/books/{id}', delete_book)
+    app.router.add_get('/v1/activity', activity)
+    app.router.add_post('/v1/heartbeat', heartbeat_config)
     return app
 
 
@@ -265,7 +296,18 @@ async def start(application, *, handler, bot, memory):
     except Exception as exc:
         print(f'Shared phone bridge unavailable: {type(exc).__name__}', flush=True)
         phone = None
-    runner = web.AppRunner(create_web_app(gateway, phone), access_log=None)
+    agent = heartbeat = None
+    if phone is not None:
+        import companion_agent
+        try:
+            agent = companion_agent.AgentStore(memory, owner)
+            await asyncio.to_thread(agent.init)
+            heartbeat = companion_agent.Heartbeat(agent, phone, bot, memory)
+            companion_agent.install(agent, heartbeat)
+        except Exception as exc:
+            print(f'Companion heartbeat unavailable: {type(exc).__name__}', flush=True)
+            agent = heartbeat = None
+    runner = web.AppRunner(create_web_app(gateway, phone, agent, heartbeat), access_log=None)
     await runner.setup()
     try:
         await web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', '8080'))).start()
@@ -273,12 +315,20 @@ async def start(application, *, handler, bot, memory):
         await runner.cleanup()
         raise
     application.bot_data['ios_api_runner'] = runner
+    if heartbeat is not None:
+        application.bot_data['companion_heartbeat_task'] = asyncio.create_task(heartbeat.loop(), name='companion-heartbeat')
+        print('Companion heartbeat enabled: durable=PostgreSQL, idle=15m, interval=50m/night2h, real_tools=on', flush=True)
     print('Owner-only iOS API enabled', flush=True)
     if phone is not None:
         await phone_bridge.probe_provider(bot, owner)
 
 
 async def stop(application):
+    task = application.bot_data.pop('companion_heartbeat_task', None)
+    if task:
+        task.cancel()
+        try: await task
+        except asyncio.CancelledError: pass
     runner = application.bot_data.pop('ios_api_runner', None)
     if runner:
         await runner.cleanup()
