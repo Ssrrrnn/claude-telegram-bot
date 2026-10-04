@@ -665,6 +665,14 @@ async def voice_command(update, context):
     )
 
 
+async def shutdown(application) -> None:
+    try:
+        await qq_connector.stop(application)
+    finally:
+        import ios_api
+        await ios_api.stop(application)
+
+
 def main() -> None:
     bot.require_config()
     memory_pg.init_db()
@@ -673,7 +681,7 @@ def main() -> None:
         ApplicationBuilder()
         .token(bot.TELEGRAM_BOT_TOKEN)
         .post_init(post_init)
-        .post_shutdown(qq_connector.stop)
+        .post_shutdown(shutdown)
         .build()
     )
     app.add_handler(CommandHandler("start", bot.start))
