@@ -295,6 +295,11 @@ async def ask_claude(chat_id: int, messages: list[dict[str, Any]], model: str) -
         ],
         "stream": False,
     }
+    import phone_bridge
+    if phone_bridge.enabled_for(chat_id):
+        import sys
+        answer = await phone_bridge.ask_with_tools(sys.modules[__name__], payload, chat_id)
+        return realtime_clock.render_clock_reply(answer, clock_kind) if clock_kind else answer
     timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS)
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(

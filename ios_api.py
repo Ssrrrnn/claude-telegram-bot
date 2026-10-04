@@ -7,6 +7,7 @@ import asyncio
 import hmac
 import json
 import os
+import re
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -152,8 +153,9 @@ class Gateway:
                 raise
 
 
-def create_web_app(gateway):
+def create_web_app(gateway, phone=None):
     from aiohttp import web
+    import phone_bridge
 
     @web.middleware
     async def protection(request, handler):
@@ -164,6 +166,8 @@ def create_web_app(gateway):
             response = await handler(request)
         except APIError as exc:
             response = web.json_response({'error': exc.message}, status=exc.status)
+        except (phone_bridge.BridgeError, ValueError, TypeError, KeyError) as exc:
+            response = web.json_response({'error': '记录或设备参数不正确，请检查后重试。'}, status=400)
         except web.HTTPException:
             raise
         except Exception as exc:
@@ -189,11 +193,56 @@ def create_web_app(gateway):
         return web.json_response({'items': await asyncio.to_thread(
             gateway.store.collection, request.match_info['kind'])})
 
-    app = web.Application(middlewares=[protection], client_max_size=32_000)
+    def phone_store():
+        if phone is None:
+            raise APIError(503, '共享日历暂不可用。')
+        return phone
+
+    async def shared_records(request):
+        store = phone_store()
+        if request.method == 'POST':
+            entry = phone_bridge.normalize_entry(await request.json(), 'user')
+            return web.json_response({'entry': await asyncio.to_thread(store.put_entry, entry)})
+        month = request.query.get('month', '')
+        if not re.fullmatch(r'\d{4}-\d{2}', month):
+            raise APIError(400, '请选择一个月份。')
+        from datetime import datetime, timedelta
+        begin = datetime.strptime(month + '-01', '%Y-%m-%d')
+        end = (begin.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        return web.json_response({'entries': await asyncio.to_thread(store.entries, begin.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))})
+
+    async def delete_shared(request):
+        identifier = phone_bridge.identifier(request.match_info['id'])
+        return web.json_response({'removed': await asyncio.to_thread(phone_store().delete_entry, identifier)})
+
+    async def phone_context(request):
+        snapshot = phone_bridge.normalize_snapshot(await request.json())
+        await asyncio.to_thread(phone_store().put_snapshot, snapshot)
+        return web.json_response({'ok': True})
+
+    async def phone_actions(request):
+        device = phone_bridge.identifier(request.query.get('device_id', ''))
+        return web.json_response({'actions': await asyncio.to_thread(phone_store().pending, device)})
+
+    async def phone_receipt(request):
+        data = await request.json()
+        if not isinstance(data, dict) or set(data) - {'device_id', 'success', 'event_id', 'message'}:
+            raise APIError(400, '回执格式不正确。')
+        device, identifier = phone_bridge.identifier(data.get('device_id', '')), phone_bridge.identifier(request.match_info['id'])
+        result = {'success': data.get('success') is True, 'event_id': phone_bridge.short(data.get('event_id', ''), 500), 'message': phone_bridge.short(data.get('message', ''), 300)}
+        return web.json_response({'result': await asyncio.to_thread(phone_store().acknowledge, device, identifier, result)})
+
+    app = web.Application(middlewares=[protection], client_max_size=128_000)
     app.router.add_get('/health', health)
     app.router.add_get('/v1/history', history)
     app.router.add_post('/v1/chat', chat)
     app.router.add_get('/v1/{kind:favorites|diaries}', collection)
+    app.router.add_get('/v1/shared', shared_records)
+    app.router.add_post('/v1/shared', shared_records)
+    app.router.add_delete('/v1/shared/{id}', delete_shared)
+    app.router.add_post('/v1/phone/context', phone_context)
+    app.router.add_get('/v1/phone/actions', phone_actions)
+    app.router.add_post('/v1/phone/actions/{id}/receipt', phone_receipt)
     return app
 
 
@@ -208,7 +257,15 @@ async def start(application, *, handler, bot, memory):
     store = Store(memory, owner)
     gateway = Gateway(owner=owner, handler=handler, store=store, token=token)
     await asyncio.to_thread(store.init)
-    runner = web.AppRunner(create_web_app(gateway), access_log=None)
+    import phone_bridge
+    phone = phone_bridge.PhoneStore(memory, owner)
+    try:
+        await asyncio.to_thread(phone.init)
+        phone_bridge.install(phone)
+    except Exception as exc:
+        print(f'Shared phone bridge unavailable: {type(exc).__name__}', flush=True)
+        phone = None
+    runner = web.AppRunner(create_web_app(gateway, phone), access_log=None)
     await runner.setup()
     try:
         await web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', '8080'))).start()

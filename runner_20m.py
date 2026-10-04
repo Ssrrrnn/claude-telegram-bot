@@ -495,7 +495,8 @@ app.runner.bot.ask_claude = ask_claude_without_ellipses
 async def stream_claude_without_role_labels(chat_id, messages, model):
     # Buffer streaming so transcript labels can never flash on screen before
     # the final sanitizer sees the whole model response.
-    if _original_stream_claude is None:
+    import phone_bridge
+    if _original_stream_claude is None or phone_bridge.enabled_for(chat_id):
         yield await ask_claude_without_ellipses(chat_id, messages, model)
         return
     model_messages = _inject_intimate_nickname_instruction(messages)
@@ -590,7 +591,13 @@ async def handle_text_with_platform(update, context) -> None:
             app.runner.memory_pg.set_setting(update.effective_chat.id, qq_connector.PLATFORM_KEY, platform)
         except Exception as exc:
             print(f"Active platform save skipped: {type(exc).__name__}", flush=True)
-    await handle_text_with_emotion(update, context)
+    import phone_bridge
+    message = getattr(update, 'message', None)
+    token = phone_bridge.begin_turn(f"{update.effective_chat.id}:{getattr(message, 'message_id', 'unknown')}")
+    try:
+        await handle_text_with_emotion(update, context)
+    finally:
+        phone_bridge.end_turn(token)
 
 
 app.runner.handle_text_with_memory = handle_text_with_platform
