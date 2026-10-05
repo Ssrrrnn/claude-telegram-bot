@@ -14,7 +14,7 @@ def validate(value, recent):
         raise ValueError('Invalid daily output')
     for field, low, high in [('diary',30,1200),('note',1,1000),('favorite_note',0,300)]:
         if not isinstance(value[field],str) or not low <= len(value[field]) <= high:
-            raise ValueError('Invalid daily text')
+            raise ValueError('Invalid daily text: '+field)
     index=value['favorite_index']
     if index is not None and (isinstance(index,bool) or not isinstance(index,int) or not 0<=index<len(recent) or recent[index]['role']!='user'):
         raise ValueError('Favorite must identify a real user message')
@@ -77,10 +77,17 @@ async def tick(application, owner, *, now=None):
         candidate=(day,recent,activities);break
     if candidate is None:return
     day,recent,activities=candidate
-    _retry_at=time.time()+600
+    _retry_at=time.time()+120
     async with lock:
-        raw=await heartbeat.generate('只返回JSON，键严格为 diary、note、favorite_index、favorite_note。diary 是80到220字的私人日记；note是一张自然亲密的小纸条；favorite_index 是资料 recent 中一句值得珍惜的用户原话的0起始索引，没有就 null；favorite_note 是收藏缘由。只根据指定日期的真实对话与已经完成的活动。没有对话就写自己的阅读或思考，不能虚构两人聊过或见过。不能捏造天气、浏览、健康或音乐。不要生成收藏原话，由程序直接取出。',{'recent':recent,'activities':activities,'day':day})
+        raw=await heartbeat.generate('只返回JSON，键严格为 diary、note、favorite_index、favorite_note。diary 是80到220字的私人日记；note是一张自然亲密的小纸条；favorite_index 是资料 recent 中一句值得珍惜的用户原话的0起始索引，没有就 null；favorite_note 是收藏缘由。只根据指定日期的真实对话与已经完成的活动。没有对话就写自己的阅读或思考，不能虚构两人聊过或见过。不能捏造天气、浏览、健康或音乐。不要生成收藏原话，由程序直接取出。',{'recent':[{'index':i,**item} for i,item in enumerate(recent)],'activities':activities,'day':day})
         raw=raw.removeprefix('```json').removeprefix('```').removesuffix('```').strip()
-        value=validate(json.loads(raw),recent)
+        try:
+            value=validate(json.loads(raw),recent)
+        except json.JSONDecodeError:
+            print('Morrow daily decision invalid: JSON syntax',flush=True)
+            raise
+        except ValueError as exc:
+            print('Morrow daily decision invalid: '+str(exc),flush=True)
+            raise
         await asyncio.to_thread(commit,memory,owner,day,value,recent)
         print('Morrow daily keepsakes committed: '+day,flush=True)
