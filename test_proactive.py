@@ -83,6 +83,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         p.start()
         self.addCleanup(p.stop)
 
+    async def test_music_link_is_atomic_but_surrounding_prose_still_splits(self):
+        card = '[你好吗？ · 歌手](https://y.qq.com/n/ryqq/songDetail/Test123)'
+        self.assertEqual(self.app.strict_split_bubbles('想把这首给你。' + card + '\n听听看！'),
+                         ['想把这首给你。', card, '听听看！'])
+
     async def test_daily_counter_cannot_block_and_history_persists(self):
         self.settings[1, 'proactive_day_count'] = '999'
         await self.app._proactive_tick(self.telegram)
@@ -283,4 +288,3 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

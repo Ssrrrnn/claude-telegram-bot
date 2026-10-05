@@ -35,6 +35,14 @@ def strict_split_bubbles(text: str) -> list[str]:
     if text.startswith(structured_prefixes) or "```" in text:
         return [text]
 
+    # Keep links intact even when a song title contains sentence punctuation.
+    links: dict[str, str] = {}
+    def protect_link(match):
+        token = f"\ue000{len(links)}\ue001"
+        links[token] = match.group(0)
+        return token
+    text = re.sub(r"\[[^\]\n]+\]\(https://[^\s)]+\)", protect_link, text)
+
     bubbles: list[str] = []
     raw_lines = [line.strip() for line in re.split(r"\r?\n+", text) if line.strip()]
 
@@ -71,7 +79,12 @@ def strict_split_bubbles(text: str) -> list[str]:
     safe = [item for item in safe if item]
     if len(safe) > 16:
         safe = safe[:15] + [" ".join(safe[15:])]
-    return safe or [text.strip()]
+    result = safe or [text.strip()]
+    for index, bubble in enumerate(result):
+        for token, link in links.items():
+            bubble = bubble.replace(token, link)
+        result[index] = bubble
+    return result
 
 
 runner._split_bubbles = strict_split_bubbles
@@ -595,4 +608,3 @@ runner.post_init = post_init_with_proactive
 
 if __name__ == "__main__":
     runner.main()
-
