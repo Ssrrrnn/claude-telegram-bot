@@ -138,6 +138,9 @@ def clean_speech(text):
             or re.search(r"(?:API 请求失败|错误：|内部协议|<favorite_message>|NO_REPLY)", value)):
         return ""
     value = re.sub(r"\*\*|__|(?<!\w)[*_](?!\w)", "", value)
+    # Speak the song name, never its catalog URL; the caption retains the card link.
+    value = re.sub(r"\[([^\]\n]+)\]\(https://[^\s)]+\)", r"\1", value)
+    value = re.sub(r"https://[^\s]+", "", value)
     # A line break in a chat reply should sound like a short pause, not a
     # run-on sentence. Avoid inserting punctuation after an existing stop.
     value = re.sub(r"(?<![。！？!?，,；;：:])\s*\n+\s*", "。", value)

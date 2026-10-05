@@ -403,6 +403,7 @@ async def ask_with_tools(bot, payload, chat_id):
     if morrow_services._store is not None:activity_tools = activity_tools + morrow_services.TOOLS
     if activity_tools:
         transcript[0]['content'] += '\n【自己的生活】你可以真正读共读书、保存独立进度和随笔、查询百科、查看活动。必须调用工具才会保存。读书先read_next_book_page，读完再finish_book_page。手机定位调用read_current_location，未授权/离线不猜。自主唤醒会自己写心情与计划，聊天无需每轮重复。'
+        transcript[0]['content'] += '\n【音乐分享】可以随聊天的心情偶尔分享一首歌。先 search_music 查询实际目录，再 share_music 准备本轮的卡片，并自然说想分享的缘由。不要每轮分享，不编造歌名、歌手、链接或会员状态，也不能说自己的播放器已经在听。'
     now = datetime.now(TZ)
     try:
         recent = await asyncio.to_thread(_store.entries, (now - timedelta(days=6)).strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d'))
@@ -426,7 +427,8 @@ async def ask_with_tools(bot, payload, chat_id):
             message = (data.get('choices') or [{}])[0].get('message') or {}
             calls = message.get('tool_calls') or []
             if not calls:
-                return bot.extract_text(data)
+                import morrow_music
+                return morrow_music.attach_shares(bot.extract_text(data), turn)
             if not isinstance(calls, list) or len(calls) > 5:
                 raise BridgeError('单轮操作过多。')
             if any(not isinstance(call, dict) or not isinstance(call.get('id'), str) or not call['id']

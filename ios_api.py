@@ -84,10 +84,35 @@ class Store:
                 row = cur.fetchone()
         return f"{row['id']}:assistant" if row else None
 
-    def collection(self, kind):
-        rows = (self.memory.list_favorites(self.owner, 30) if kind == 'favorites'
-                else self.memory.list_diary(self.owner, 30))
-        return [{'id': str(row['id']), 'text': row['text']} for row in rows]
+    def collection(self, kind, before=None, limit=50):
+        from datetime import datetime, timezone
+        tables = {'favorites': ('favorites', 'note'), 'diaries': ('companion_diary', 'NULL AS note'),
+                  'memories': ('memories', 'kind,importance,NULL AS note')}
+        if kind not in tables:
+            raise ValueError('Unknown collection')
+        table, fields = tables[kind]
+        params = [self.owner]
+        cursor = ''
+        if before is not None:
+            cursor = ' AND id < %s'
+            params.append(before)
+        params.append(limit + 1)
+        with self.memory._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f'SELECT id,text,created_at,{fields} FROM {table} '
+                            f'WHERE chat_id=%s{cursor} ORDER BY id DESC LIMIT %s', params)
+                rows = cur.fetchall()
+        items = []
+        for row in rows[:limit]:
+            at = row.get('created_at')
+            if isinstance(at, datetime):
+                at = at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at
+                at = at.isoformat()
+            items.append({'id': str(row['id']), 'text': row['text'], 'at': at,
+                          'note': row.get('note'), 'kind': row.get('kind'), 'importance': row.get('importance')})
+        more = len(rows) > limit
+        return {'items': items, 'has_more': more,
+                'next_before': items[-1]['id'] if more and items else None}
 
 
 class APIError(Exception):
@@ -213,8 +238,14 @@ def create_web_app(gateway, phone=None, agent=None, heartbeat=None):
         return web.json_response(await gateway.process(data))
 
     async def collection(request):
-        return web.json_response({'items': await asyncio.to_thread(
-            gateway.store.collection, request.match_info['kind'])})
+        before = request.query.get('before')
+        limit = request.query.get('limit', '50')
+        if set(request.query) - {'before', 'limit'} or not re.fullmatch(r'[1-9]\d{0,2}', limit) or not 1 <= int(limit) <= 100:
+            raise APIError(400, '珍藏分页参数不正确。')
+        if before is not None and (not re.fullmatch(r'[1-9]\d{0,18}', before) or int(before) > 2**63-1):
+            raise APIError(400, '珍藏分页编号不正确。')
+        return web.json_response(await asyncio.to_thread(
+            gateway.store.collection, request.match_info['kind'], int(before) if before else None, int(limit)))
 
     def phone_store():
         if phone is None:
@@ -289,7 +320,7 @@ def create_web_app(gateway, phone=None, agent=None, heartbeat=None):
     app.router.add_post('/mcp',mcp)
     app.router.add_get('/v1/history', history)
     app.router.add_post('/v1/chat', chat)
-    app.router.add_get('/v1/{kind:favorites|diaries}', collection)
+    app.router.add_get('/v1/{kind:favorites|diaries|memories}', collection)
     app.router.add_get('/v1/shared', shared_records)
     app.router.add_post('/v1/shared', shared_records)
     app.router.add_delete('/v1/shared/{id}', delete_shared)

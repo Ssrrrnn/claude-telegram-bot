@@ -3,10 +3,12 @@ import base64
 import copy
 import time
 import unittest
+from datetime import datetime, timezone
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 from aiohttp.test_utils import TestClient, TestServer
-from ios_api import APIError, Gateway, create_web_app
+from ios_api import APIError, Gateway, Store, create_web_app
 
 
 class FakeStore:
@@ -27,8 +29,29 @@ class FakeStore:
         return [{'id': '1:assistant', 'role': 'assistant', 'text': '我在。'}]
     def assistant_id(self, message_id):
         return '1:assistant'
-    def collection(self, kind):
-        return [{'id': '1', 'text': kind}]
+    def collection(self, kind, before=None, limit=50):
+        return {'items': [{'id': '1', 'text': kind}], 'has_more': False, 'next_before': None}
+
+
+class CollectionStoreTests(unittest.TestCase):
+    def test_real_memory_query_is_owner_scoped_and_has_stable_cursor(self):
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor.fetchall.return_value = [
+            {'id': 9, 'text': 'Private owner memory', 'created_at': datetime(2026, 10, 5, tzinfo=timezone.utc), 'kind': 'manual', 'importance': 3},
+            {'id': 8, 'text': 'Next page', 'created_at': datetime(2026, 10, 4, tzinfo=timezone.utc)}]
+        connection = MagicMock(); connection.__enter__.return_value = connection; connection.cursor.return_value = cursor
+        memory = MagicMock(); memory._connect.return_value = connection
+        result = Store(memory, 123).collection('memories', before=10, limit=1)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn('WHERE chat_id=%s AND id < %s', sql)
+        self.assertEqual(params, [123, 10, 2])
+        self.assertEqual(result['next_before'], '9')
+        self.assertTrue(result['has_more'])
+        self.assertEqual(result['items'][0]['importance'], 3)
+        self.assertEqual(result['items'][0]['at'], '2026-10-05T00:00:00+00:00')
+        with self.assertRaises(ValueError):
+            Store(memory, 123).collection('memories WHERE TRUE')
 
 
 class APITests(unittest.IsolatedAsyncioTestCase):
@@ -48,7 +71,7 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         return {'request_id': str(uuid4()), 'text': '晚上好', 'sent_at': time.time(), **changes}
 
     async def test_all_private_routes_require_token(self):
-        for route in ['/v1/history', '/v1/favorites', '/v1/diaries']:
+        for route in ['/v1/history', '/v1/favorites', '/v1/diaries', '/v1/memories']:
             response = await self.client.get(route)
             self.assertEqual(response.status, 401)
             self.assertEqual(response.headers['Cache-Control'], 'no-store')
@@ -152,6 +175,13 @@ class APITests(unittest.IsolatedAsyncioTestCase):
     async def test_bad_json(self):
         response = await self.client.post('/v1/chat', data='{', headers=self.headers)
         self.assertEqual(response.status, 400)
+
+    async def test_collection_cursor_rejects_injection_or_unbounded_limits(self):
+        for query in ['limit=101', 'limit=0', 'before=-1', 'before=1%20OR%201=1', 'before=9999999999999999999', 'owner=999']:
+            response = await self.client.get('/v1/memories?' + query, headers=self.headers)
+            self.assertEqual(response.status, 400)
+        response = await self.client.get('/v1/memories?before=12&limit=50', headers=self.headers)
+        self.assertEqual(response.status, 200)
 
 
 if __name__ == '__main__':

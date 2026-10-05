@@ -138,9 +138,14 @@ TOOLS=[
     bridge.tool('read_browsing_history','查看真实网页读取日志，失败不代表已读。',{}),
     bridge.tool('read_listening_context','读取用户自愿分享的当前播放信息，at 为采样时间。不能声称自己的设备也在播放。',{}),
     bridge.tool('read_health_summary','读取用户自愿分享的步数与睡眠概要，注意来源及采样时间。没有值不代表为0；不作医疗诊断。',{}),
+    bridge.tool('search_music','实际查询 QQ 音乐公开歌曲目录，按歌名或歌手查找，最多返回5首。没有结果不编造歌曲链接。',{'query':{'type':'string'}},('query',)),
+    bridge.tool('share_music','在本轮 Morrow 聊天回复中分享已用 search_music 查到的歌曲，呈现可点击的音乐卡片。不代表自己已播放。',{'song_mid':{'type':'string'}},('song_mid',)),
 ]
 async def execute(name,args,turn=None):
     if _store is None:raise bridge.BridgeError('扩展服务未连接。')
+    if name in ('search_music','share_music'):
+        import morrow_music
+        return await morrow_music.execute(name,args,turn)
     if name=='browse_public_page':
         if set(args)!={'url'}:raise ValueError('Invalid browser args')
         return await browse_url(args['url'])

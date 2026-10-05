@@ -10,6 +10,12 @@ import voice_output
 
 
 class VoiceDeliveryTests(unittest.TestCase):
+    def test_music_card_links_are_not_read_aloud(self):
+        text = '想把这首给你。\n[Song · Artist](https://y.qq.com/n/ryqq/songDetail/Test123)'
+        speech = voice_output.clean_speech(text)
+        self.assertIn('Song · Artist', speech)
+        self.assertNotIn('https', speech)
+        self.assertNotIn('Test123', speech)
     def test_mode_and_reply_selection(self):
         self.assertEqual(voice_output.mode(lambda chat, key: None, 7), "auto")
         self.assertFalse(voice_output.wants_audio("auto", user_text="今天怎么样"))
