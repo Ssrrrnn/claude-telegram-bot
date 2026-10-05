@@ -31,6 +31,10 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(daily.validate(value,recent)['favorite_index'],0)
         for index in [True,1,2,-1,'0']:
             with self.assertRaises(ValueError):daily.validate({**value,'favorite_index':index},recent)
+    def test_absent_favorite_reason_does_not_block_private_diary(self):
+        value={'diary':'一天的真实记忆。'*8,'note':'留给你的一句话','favorite_index':None,'favorite_note':None}
+        self.assertEqual(daily.validate(value,[])['favorite_note'],'')
+
     async def test_mcp_never_reports_failed_read_as_success(self):
         with patch.object(services,'_store',object()),patch.object(services,'browse_url',AsyncMock(side_effect=ValueError('private secret'))):
             result=await services.mcp({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'browse_public_page','arguments':{'url':'https://example.com'}}})

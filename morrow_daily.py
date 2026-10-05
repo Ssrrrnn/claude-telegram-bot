@@ -12,6 +12,7 @@ _retry_at = 0
 def validate(value, recent):
     if not isinstance(value, dict) or set(value) != {'diary','note','favorite_index','favorite_note'}:
         raise ValueError('Invalid daily output')
+    if value['favorite_note'] is None:value={**value,'favorite_note':''}
     for field, low, high in [('diary',30,1200),('note',1,1000),('favorite_note',0,300)]:
         if not isinstance(value[field],str) or not low <= len(value[field]) <= high:
             raise ValueError('Invalid daily text: '+field)
