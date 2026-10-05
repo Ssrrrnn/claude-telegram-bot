@@ -55,7 +55,7 @@ CLAIMED_OWNER_ID: int | None = TELEGRAM_OWNER_ID
 
 def require_config() -> None:
     missing = []
-    if not TELEGRAM_BOT_TOKEN:
+    if not TELEGRAM_BOT_TOKEN and os.getenv("MORROW_ONLY") != "1":
         missing.append("TELEGRAM_BOT_TOKEN")
     if not LLMHUB_API_KEY:
         missing.append("LLMHUB_API_KEY")

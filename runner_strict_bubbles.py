@@ -1,4 +1,5 @@
 import asyncio
+import os
 import json
 import re
 import time
@@ -453,7 +454,11 @@ async def _proactive_tick(application):
                          (voice_mode == "auto" and voice_output.auto_spontaneous(
                              runner.memory_pg.get_setting, chat_id, reply_text=text,
                              proactive=True, unanswered=state["silence_count"] > 0)))
-        platform = read(qq_connector.PLATFORM_KEY) or "telegram"
+        platform = "ios" if os.getenv("MORROW_ONLY") == "1" else (read(qq_connector.PLATFORM_KEY) or "telegram")
+        sent_as_voice = False
+        if platform == "ios":
+            # A committed shared-history row is the durable app inbox. No external send.
+            await asyncio.to_thread(runner.memory_pg.save_recent_proactive, chat_id, text)
         if platform == "qq":
             connector = application.bot_data.get("qq_connector")
             if connector is None or connector.ws is None:
@@ -463,7 +468,7 @@ async def _proactive_tick(application):
                 sent_as_voice = await connector.send_proactive(
                     text, strict_split_bubbles(text), as_voice=send_as_voice,
                 )
-        if platform != "qq":
+        if platform not in ("qq", "ios"):
             voice_key = f'telegram:proactive_voice:{int(now)}'
             begin_action = getattr(runner.memory_pg, 'begin_action', None)
             finish_action = getattr(runner.memory_pg, 'finish_action', None)
@@ -492,7 +497,8 @@ async def _proactive_tick(application):
         runner.memory_pg.set_setting(chat_id, KEY_LAST_PROACTIVE_AT, str(sent_at))
         runner.memory_pg.set_setting(chat_id, KEY_LAST_INTERACTION_AT, str(sent_at))
         try:
-            runner.memory_pg.save_recent_proactive(chat_id, text)
+            if platform != "ios":
+                runner.memory_pg.save_recent_proactive(chat_id, text)
         except Exception as exc:
             print(f"Recent proactive save skipped: {type(exc).__name__}", flush=True)
         runner.bot.histories[chat_id].append({"role": "assistant", "content": text})
@@ -509,7 +515,11 @@ async def proactive_loop(application):
             chat_id = _owner_chat_id()
             if chat_id is not None and runner.bot.is_authorized(chat_id):
                 import companion_features
-                await companion_features.auto_diary_tick(runner.memory_pg, runner.bot, chat_id)
+                if os.getenv("MORROW_ONLY") == "1":
+                    import morrow_daily
+                    await morrow_daily.tick(application, chat_id)
+                else:
+                    await companion_features.auto_diary_tick(runner.memory_pg, runner.bot, chat_id)
                 connector = application.bot_data.get('qq_connector')
                 if connector is not None:
                     await connector.publish_pending_diary()
@@ -585,3 +595,4 @@ runner.post_init = post_init_with_proactive
 
 if __name__ == "__main__":
     runner.main()
+

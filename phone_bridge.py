@@ -307,6 +307,9 @@ read_phone_context带采样时间；过期或离线要直说最后一次同步�
 
 
 async def execute(name, args, store, turn):
+    import morrow_services
+    if name in {item['function']['name'] for item in morrow_services.TOOLS}:
+        return await morrow_services.execute(name,args,turn)
     import companion_agent
     if name in {item['function']['name'] for item in companion_agent.TOOLS}:
         return await companion_agent.execute(name, args, turn)
@@ -396,6 +399,8 @@ async def ask_with_tools(bot, payload, chat_id):
     transcript = [dict(item) for item in payload['messages']]
     transcript[0] = {**transcript[0], 'content': transcript[0]['content'] + '\n\n' + GUARD}
     activity_tools = companion_agent.TOOLS if companion_agent._store is not None else []
+    import morrow_services
+    if morrow_services._store is not None:activity_tools = activity_tools + morrow_services.TOOLS
     if activity_tools:
         transcript[0]['content'] += '\n【自己的生活】你可以真正读共读书、保存独立进度和随笔、查询百科、查看活动。必须调用工具才会保存。读书先read_next_book_page，读完再finish_book_page。手机定位调用read_current_location，未授权/离线不猜。自主唤醒会自己写心情与计划，聊天无需每轮重复。'
     now = datetime.now(TZ)

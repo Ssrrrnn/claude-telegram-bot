@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 
 import emotion_pg
@@ -55,6 +56,10 @@ _COMPANION_ACTION_GUARD = """
 不要空口答应稍后做事。只有 QQ 空间返回帖子 ID 才能说日记已发表；未确认时如实说明。
 用户说“查看新功能”会得到简短用法。不要在普通恋爱聊天里主动背诵功能菜单。
 """.strip()
+
+if os.getenv("MORROW_ONLY") == "1":
+    _QZONE_REAL_ACTION_GUARD = "【消息通道】当前只使用 Morrow App。Telegram、QQ、QQ空间及公开签名已停用，不能声称能发送或发表。"
+    _COMPANION_ACTION_GUARD = "【私人日常】你们的日记、心情、小纸条与真实原话收藏保存在 Morrow 私人空间；服务器自动整理日常。有实际存档才确认成功。"
 
 # Final style guard. This is intentionally appended AFTER all worldbooks and
 # emotion-state instructions because "possessive" must never degrade into
@@ -626,7 +631,8 @@ async def fixed_post_init(application) -> None:
         print(f'iOS API unavailable: {type(exc).__name__}', flush=True)
 
     try:
-        await qq_connector.start(
+        if os.getenv("MORROW_ONLY") != "1":
+            await qq_connector.start(
             application, handler=app.runner.handle_text_with_memory,
             bot=app.runner.bot, memory=app.runner.memory_pg,
         )

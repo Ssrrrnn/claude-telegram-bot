@@ -839,3 +839,17 @@ allow_long_term=false时memories必须为[]、relationship_state为null，但仍
         if note is not None:
             note = str(note).strip()[:500]
         add_favorite(chat_id, telegram_message_id, user_text, note)
+
+
+
+def diary_context_between(chat_id, since, until, limit=30):
+    """Dated evidence for repairing private diaries without mixing subsequent days."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_text,assistant_text FROM recent_conversation WHERE chat_id=%s AND created_at>=%s AND created_at<%s ORDER BY id DESC LIMIT %s",(chat_id,since,until,limit))
+            rows=list(reversed(cur.fetchall()))
+    result=[]
+    for row in rows:
+        if row.get('user_text'):result.append({'role':'user','content':row['user_text']})
+        if row.get('assistant_text'):result.append({'role':'assistant','content':row['assistant_text']})
+    return result

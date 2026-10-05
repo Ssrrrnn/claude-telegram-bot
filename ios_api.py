@@ -176,6 +176,27 @@ def create_web_app(gateway, phone=None, agent=None, heartbeat=None):
         response.headers['Cache-Control'] = 'no-store'
         return response
 
+    async def browsing(request):
+        import morrow_services
+        if morrow_services._store is None:raise APIError(503,'浏览日志暂不可用。')
+        return web.json_response({'items':await asyncio.to_thread(morrow_services._store.browsing)})
+
+    async def extension_context(request):
+        import morrow_services
+        store=morrow_services._store
+        if store is None:raise APIError(503,'扩展服务暂不可用。')
+        kind=request.match_info['kind']
+        if request.method=='POST':
+            data=morrow_services.normalize_context(kind,await request.json())
+            await asyncio.to_thread(store.put_context,kind,data)
+            return web.json_response({'ok':True})
+        return web.json_response({'context':await asyncio.to_thread(store.context,kind)})
+
+    async def mcp(request):
+        import morrow_services
+        result=await morrow_services.mcp(await request.json())
+        return web.json_response(result) if result is not None else web.Response(status=202)
+
     async def health(request):
         return web.json_response({'ok': True})
 
@@ -260,6 +281,10 @@ def create_web_app(gateway, phone=None, agent=None, heartbeat=None):
 
     app = web.Application(middlewares=[protection], client_max_size=128_000)
     app.router.add_get('/health', health)
+    app.router.add_get('/v1/browsing',browsing)
+    app.router.add_get('/v1/context/{kind:health|listening}',extension_context)
+    app.router.add_post('/v1/context/{kind:health|listening}',extension_context)
+    app.router.add_post('/mcp',mcp)
     app.router.add_get('/v1/history', history)
     app.router.add_post('/v1/chat', chat)
     app.router.add_get('/v1/{kind:favorites|diaries}', collection)
@@ -307,6 +332,10 @@ async def start(application, *, handler, bot, memory):
         except Exception as exc:
             print(f'Companion heartbeat unavailable: {type(exc).__name__}', flush=True)
             agent = heartbeat = None
+    import morrow_services
+    extensions=morrow_services.ServiceStore(memory,owner)
+    await asyncio.to_thread(extensions.init)
+    morrow_services.install(extensions)
     runner = web.AppRunner(create_web_app(gateway, phone, agent, heartbeat), access_log=None)
     await runner.setup()
     try:
@@ -316,6 +345,7 @@ async def start(application, *, handler, bot, memory):
         raise
     application.bot_data['ios_api_runner'] = runner
     if heartbeat is not None:
+        application.bot_data['companion_heartbeat'] = heartbeat
         application.bot_data['companion_heartbeat_task'] = asyncio.create_task(heartbeat.loop(), name='companion-heartbeat')
         print('Companion heartbeat enabled: durable=PostgreSQL, idle=15m, interval=50m/night2h, real_tools=on', flush=True)
     print('Owner-only iOS API enabled', flush=True)

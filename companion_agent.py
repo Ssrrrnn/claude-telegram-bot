@@ -184,6 +184,13 @@ async def execute(name,args,turn):
     if name=='search_personal_topic':
         result=await search_topic(args['query'])
         receipt=await asyncio.to_thread(_store.record,'research','done' if result['sources'] else 'empty','查了查：'+result['query'],result['message'],result)
+        import morrow_services
+        if result['sources'] and morrow_services._store is not None:
+            source=result['sources'][0]
+            url=source.get('url') if isinstance(source,dict) else None
+            if url:
+                try:await morrow_services.browse_url(url)
+                except bridge.BridgeError:pass
         return {'status':receipt['status'],'receipt':receipt,'sources':result['sources']}
     key='note:'+json.dumps(args,sort_keys=True,ensure_ascii=False)
     if key in turn['results']:return turn['results'][key]

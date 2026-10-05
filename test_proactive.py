@@ -96,6 +96,19 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.app._proactive_tick(self.telegram)
         self.assertEqual(self.telegram.bot.send_message.await_count, 1)
 
+    async def test_morrow_only_writes_durable_inbox_without_qq_or_telegram(self):
+        saved=[]
+        self.app.runner.memory_pg.save_recent_proactive=lambda chat,text:saved.append(text)
+        qq=types.SimpleNamespace(ws=object(),send_proactive=AsyncMock())
+        self.telegram.bot_data={'qq_connector':qq}
+        self.settings[1,'last_active_platform_v1']='qq'
+        with patch.dict('os.environ',{'MORROW_ONLY':'1'}):
+            await self.app._proactive_tick(self.telegram)
+            await self.app._proactive_tick(self.telegram)
+        self.assertEqual(len(saved),1)
+        self.telegram.bot.send_message.assert_not_awaited();qq.send_proactive.assert_not_awaited()
+        self.assertEqual(saved[0],self.app.runner.bot.histories[1][-1]['content'])
+
     async def test_recent_qq_contact_receives_single_proactive_in_qq(self):
         self.settings[1, 'last_active_platform_v1'] = 'qq'
         qq = types.SimpleNamespace(ws=object(), send_proactive=AsyncMock(return_value=False))
@@ -270,3 +283,4 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

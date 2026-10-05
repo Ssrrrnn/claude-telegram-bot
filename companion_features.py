@@ -1,3 +1,4 @@
+import os
 """Owner controlled companion routines shared by Telegram and QQ."""
 
 import json
@@ -138,11 +139,11 @@ async def diary_command(db, bot, chat_id, text, message_id):
     if value in ("开启自动日记", "关闭自动日记"):
         enabled = value.startswith("开启")
         db.set_setting(chat_id, AUTO_DIARY_KEY, '1' if enabled else '0')
-        return '好，晚上有值得记住的事，我会写日记发到空间，好友可见。' if enabled else '好，自动写日记关掉了。'
+        return ('好，晚上会把值得记住的日常收进 Morrow。' if os.getenv('MORROW_ONLY') == '1' else '好，晚上有值得记住的事，我会写日记发到空间，好友可见。') if enabled else '好，自动写日记关掉了。'
     if value in ("查看双人日记", "看看双人日记", "查看日记", "看看日记"):
         rows = db.list_diary(chat_id)
-        status = {'published': '已发空间', 'pending': '待发空间',
-                  'attempting': '发表中', 'uncertain': '发表未确认', 'private': '旧日记'}
+        status = {'published': '已发空间', 'pending': '已存小家' if os.getenv('MORROW_ONLY') == '1' else '待发空间',
+                  'attempting': '发表中', 'uncertain': '发表未确认', 'private': '私人日记'}
         return ("还没有写过双人日记。" if not rows else "我们的日记：\n" + "\n".join(
             f"#{row['id']} {row['created_at'].astimezone(LOCAL):%m月%d日} "
             f"{status.get(row.get('publish_status'), '待发空间')} {row['text'][:35]}"
@@ -161,7 +162,7 @@ async def diary_command(db, bot, chat_id, text, message_id):
             return "这篇已经发到空间或正在发表；删除本地日记不会撤回空间内容。"
         return "这篇日记删掉了。" if db.delete_diary(chat_id, diary_id) else "没找到这篇日记。"
     if diary_publish_id(value) is not None:
-        return "新日记会自动发到空间；旧日记请在 QQ 私聊里说‘发日记 #编号 到空间’。"
+        return "QQ 空间已停用，日记留在 Morrow。" if os.getenv("MORROW_ONLY") == "1" else "新日记会自动发到空间；旧日记请在 QQ 私聊里说‘发日记 #编号 到空间’。"
     match = re.fullmatch(r"(?:写(?:一篇|篇|个)?|记(?:一篇|篇)?)?(?:我们的|双人)?日记(?:[：:]\s*(.{1,200}))?", value)
     if not match or not re.search(r"写|记|日记", value):
         return None
@@ -173,14 +174,14 @@ async def diary_command(db, bot, chat_id, text, message_id):
     if not content:
         return "这一篇没写好，等我们再聊一会儿。"
     diary_id = db.save_diary(chat_id, message_id, content)
-    return f"日记 #{diary_id} 写好了，正在等 QQ 空间确认发表；发成后我会告诉你。\n{content}"
+    return (f"日记 #{diary_id} 收在 Morrow 里了。\n{content}" if os.getenv("MORROW_ONLY") == "1" else f"日记 #{diary_id} 写好了，正在等 QQ 空间确认发表；发成后我会告诉你。\n{content}")
 
 
 async def _write_diary(bot, chat_id, recent, hint=""):
     answer = await bot.ask_claude(chat_id, [
         *recent[-12:],
         {"role": "user", "content": (
-            "【将发表到好友可见 QQ 空间的双人日记】根据确实出现过的对话，"
+            ("【Morrow 私人双人日记，不公开发表】" if os.getenv("MORROW_ONLY") == "1" else "【将发表到好友可见 QQ 空间的双人日记】") + "根据确实出现过的对话，"
             "用我们的口吻写80到220字的一小段日记。表达具体情绪和关系进展；"
             "不要编造现实见面、天气或共同经历。不要泄露任何实名、账号、"
             "位置、日程、健康或工作细节，也不要引用私聊原话或提到第三人。"
@@ -203,10 +204,10 @@ async def auto_diary_tick(db, bot, chat_id, *, now=None):
         return
     # Claim before the model call so concurrent loops or restarts do not
     # generate and save two pages for the same day.
-    db.set_setting(chat_id, AUTO_DIARY_DAY_KEY, day)
     content = await _write_diary(bot, chat_id, recent)
     if content:
         db.save_diary(chat_id, -int(now.strftime('%Y%m%d')), content)
+        db.set_setting(chat_id, AUTO_DIARY_DAY_KEY, day)
 
 
 def action_status(db, chat_id, text):
@@ -235,3 +236,4 @@ def feature_help(text):
             "切到撒娇模式｜切到安慰模式｜恢复自然模式\n"
             "查看动作记录。QQ 里还能说‘换个性签名’‘关闭自动签名’；"
             "新日记写好后会自动发到 QQ 空间，好友可见；发表结果以空间帖子 ID 为准。")
+
