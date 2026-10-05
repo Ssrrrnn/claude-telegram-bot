@@ -57,6 +57,17 @@ class ExtensionAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await response.json())['context']['steps'],12)
         response=await self.client.post('/v1/context/health',headers=self.headers,data='null',skip_auto_headers={'Content-Type'})
         self.assertEqual(response.status,200);self.assertIsNone(self.context['health'])
+    async def test_mcp_transport_negotiation_notifications_ping_and_origin(self):
+        initialize={'jsonrpc':'2.0','method':'initialize','id':1,'params':{'protocolVersion':'2025-11-25'}}
+        response=await self.client.post('/mcp',headers=self.headers,json=initialize)
+        self.assertEqual((await response.json())['result']['protocolVersion'],'2025-11-25')
+        response=await self.client.post('/mcp',headers=self.headers,json={'jsonrpc':'2.0','method':'notifications/initialized'})
+        self.assertEqual(response.status,202)
+        response=await self.client.post('/mcp',headers=self.headers,json={'jsonrpc':'2.0','method':'ping','id':2})
+        self.assertEqual((await response.json())['result'],{})
+        response=await self.client.post('/mcp',headers={**self.headers,'Origin':'https://unexpected.example'},json=initialize)
+        self.assertEqual(response.status,403)
+
     async def test_mcp_lists_only_bounded_owner_tools(self):
         response=await self.client.post('/mcp',headers=self.headers,json={'jsonrpc':'2.0','method':'tools/list','id':7})
         data=await response.json();self.assertEqual(data['id'],7)

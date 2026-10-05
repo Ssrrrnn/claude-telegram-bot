@@ -153,7 +153,10 @@ async def execute(name,args,turn=None):
 async def mcp(data):
     if not isinstance(data,dict) or data.get('jsonrpc')!='2.0':raise ValueError('Invalid RPC')
     request_id=data.get('id');method=data.get('method');params=data.get('params') or {}
-    if method=='initialize':result={'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'morrow-public-reader','version':'1.0'}}
+    if 'id' not in data:return None
+    if not isinstance(params,dict):raise ValueError('Invalid RPC params')
+    if method=='initialize':result={'protocolVersion':params.get('protocolVersion') if params.get('protocolVersion') in ('2025-03-26','2025-06-18','2025-11-25') else '2025-11-25','capabilities':{'tools':{}},'serverInfo':{'name':'morrow-public-reader','version':'1.0'}}
+    elif method=='ping':result={}
     elif method=='tools/list':result={'tools':[{'name':t['function']['name'],'description':t['function']['description'],'inputSchema':t['function']['parameters']} for t in TOOLS]}
     elif method=='tools/call':
         try:

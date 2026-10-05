@@ -229,6 +229,8 @@ def action_status(db, chat_id, text):
 def feature_help(text):
     if text.strip().rstrip("？?。！! ") not in ("查看新功能", "新功能说明"):
         return None
+    if os.getenv("MORROW_ONLY") == "1":
+        return ("日记、心情、小纸条与收藏都收在 Morrow。你可以说‘写一篇双人日记’‘查看日记’‘关闭自动日记’，也可以让我查看你自愿分享的播放或健康概要、查阅公开网页。真实网页读取会留下日志。Telegram、QQ 和空间发布已停用；不会声称在另一台设备同步播放。")
     return ("你可以这样跟我说：\n"
             "明天15:00问我面试怎么样｜查看回访｜取消回访 #编号\n"
             "记住：你的偏好｜查看记忆｜纠正记忆 #编号：正确内容｜忘掉记忆 #编号\n"

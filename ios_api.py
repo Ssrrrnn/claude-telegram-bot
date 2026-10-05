@@ -193,6 +193,8 @@ def create_web_app(gateway, phone=None, agent=None, heartbeat=None):
         return web.json_response({'context':await asyncio.to_thread(store.context,kind)})
 
     async def mcp(request):
+        origin=request.headers.get('Origin')
+        if origin and origin != 'https://'+request.host:raise APIError(403,'MCP Origin is not allowed')
         import morrow_services
         result=await morrow_services.mcp(await request.json())
         return web.json_response(result) if result is not None else web.Response(status=202)
