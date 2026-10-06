@@ -201,6 +201,22 @@ def create_web_app(gateway, phone=None, agent=None, heartbeat=None):
         response.headers['Cache-Control'] = 'no-store'
         return response
 
+    from morrow_radio import RadioError, RadioSpeech
+    radio_voice = RadioSpeech(getattr(gateway.store, 'memory', None), gateway.owner)
+
+    async def radio_speech(request):
+        raw = await request.read()
+        if len(raw) > 4096:
+            raise APIError(400, '电台段落太长，请分段朗读。')
+        try:
+            data = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            raise APIError(400, '电台内容格式不正确。')
+        try:
+            return web.json_response(await radio_voice.read(data))
+        except RadioError as exc:
+            raise APIError(exc.status, exc.message)
+
     async def browsing(request):
         import morrow_services
         if morrow_services._store is None:raise APIError(503,'浏览日志暂不可用。')
@@ -314,6 +330,7 @@ def create_web_app(gateway, phone=None, agent=None, heartbeat=None):
 
     app = web.Application(middlewares=[protection], client_max_size=128_000)
     app.router.add_get('/health', health)
+    app.router.add_post('/v1/radio/speech', radio_speech)
     app.router.add_get('/v1/browsing',browsing)
     app.router.add_get('/v1/context/{kind:health|listening}',extension_context)
     app.router.add_post('/v1/context/{kind:health|listening}',extension_context)
