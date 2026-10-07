@@ -33,6 +33,7 @@ class CallHistoryTests(unittest.TestCase):
         sql, params = cursor.execute.call_args.args
         self.assertIn('NOT EXISTS', sql)
         self.assertIn("r.user_text LIKE 'call:%%'", sql)
+        self.assertIn("r.result ? 'session_id' AND r.result ? 'segments'", sql)
         self.assertIn('c.telegram_message_id=4611686018427387904+r.id', sql)
         self.assertEqual(params, (123,))
 

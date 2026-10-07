@@ -69,6 +69,7 @@ class Store:
                 cur.execute("SELECT id,user_text,assistant_text FROM recent_conversation c "
                             "WHERE chat_id=%s AND NOT EXISTS (SELECT 1 FROM ios_requests r "
                             "WHERE r.chat_id=c.chat_id AND r.user_text LIKE 'call:%%' "
+                            "AND r.result ? 'session_id' AND r.result ? 'segments' "
                             "AND c.telegram_message_id=4611686018427387904+r.id) "
                             "ORDER BY id DESC LIMIT 40", (self.owner,))
                 rows = list(reversed(cur.fetchall()))
