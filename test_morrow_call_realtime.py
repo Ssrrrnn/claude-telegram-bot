@@ -134,6 +134,29 @@ class RealtimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.store.get(self.request['request_id'])['result']['played_indices'], [0])
             self.memory.save_recent_turn.assert_not_called(); await socket.close()
 
+    async def testInterruptCancelsInFlightVoiceAndNextTurnUsesOnlyPlayedContext(self):
+        closed, waiting = asyncio.Event(), asyncio.Event()
+        self.store.call_history = lambda session: call_messages([
+            row for row in self.store.rows.values()
+            if row['user_text'].startswith('call:' + session + ':') and row['status'] in ('done', 'interrupted')])
+        async def voice(text):
+            try:
+                yield b'\x00\x00'
+                await waiting.wait()
+            finally: closed.set()
+        with patch('morrow_call_realtime.sentence_stream', self.sentences), patch('morrow_call_realtime.pcm_stream', voice):
+            socket = await self.connect(); await socket.send_json(self.request)
+            await self.until(socket, 'audio')
+            await socket.send_json({'type':'interrupt','request_id':self.request['request_id']})
+            await self.until(socket, 'interrupted')
+            self.assertTrue(closed.is_set())
+            service = CallService(self.gateway, self.heartbeat)
+            messages = await service.messages('再说一句', False, self.request['session_id'], streaming=True)
+            self.assertIn({'role':'user','content':self.request['text']}, messages)
+            self.assertNotIn({'role':'assistant','content':'Take your time.'}, messages)
+            self.assertEqual(messages[-1], {'role':'user','content':'再说一句'})
+            await socket.close()
+
     async def testAudioFailureKeepsCaptionAndConnectionAcceptsNextUtterance(self):
         async def failure(text):
             raise RuntimeError('private-key')

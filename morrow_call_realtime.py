@@ -253,8 +253,6 @@ class RealtimeCall:
         except CallError as exc:
             if not self.socket.closed:
                 await self.emit('error', data.get('request_id'), message=exc.message, status=exc.status)
-        except (ConnectionError, RuntimeError):
-            pass  # Socket disconnect; cancellation/finally retains interrupted receipt.
         except Exception as exc:
             print('Realtime call event failed: ' + type(exc).__name__, flush=True)
             if not self.socket.closed:
