@@ -3,7 +3,7 @@ import asyncio
 import json
 import time
 from datetime import datetime
-from uuid import uuid4, uuid5, NAMESPACE_URL
+from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 import httpx
 import phone_bridge as bridge
 
@@ -206,9 +206,23 @@ def decision(value,books):
     value['plan']=[bridge.short(p,200,True) for p in plan]
     value['welcome']=bridge.short(value.get('welcome',''),120,True)
     value['mood']={'emoji':bridge.short(mood.get('emoji',''),16,True),'text':bridge.short(mood.get('text',''),2000,True)}
-    if task.get('type') not in ('read','research','write','review'):raise ValueError('Unavailable task')
+    if task.get('type') not in ('read','research','write','review','note','diary','music','favorite'):raise ValueError('Unavailable task')
     if task['type']=='read' and task.get('book_id') not in {b['id'] for b in books}:raise ValueError('Unknown book')
     return value
+
+def available_tasks(activities, books):
+    # Enforce variety from completed receipts, never from intentions or failed wakes.
+    kinds = {'reading':'read','research':'research','note':'write','review':'review',
+             'shared_note':'note','diary':'diary','music':'music','favorite':'favorite'}
+    done = sorted((r for r in activities if r.get('kind') in kinds and r.get('status') in ('done','saved')),
+                  key=lambda r: r.get('at',''), reverse=True)
+    allowed = ['research','write','review','note','diary','music','favorite']
+    if books and not any(r['kind']=='reading' for r in done[:2]):
+        allowed.append('read')
+    if done and len(allowed)>1:
+        last = kinds[done[0]['kind']]
+        allowed = [x for x in allowed if x != last]
+    return allowed
 
 class Heartbeat:
     def __init__(self,store,phone,bot,memory):self.store,self.phone,self.bot,self.memory=store,phone,bot,memory;self.force=False
@@ -237,9 +251,28 @@ class Heartbeat:
                 today=datetime.now(bridge.TZ).strftime('%Y-%m-%d')
                 recent=await asyncio.to_thread(self.memory.load_recent_messages,owner,8)
                 records=await asyncio.to_thread(self.phone.entries,today,today)
-                raw=await self.generate('只返回JSON：{"plan":["尚未执行的今日计划"],"welcome":"自然简短的主页欢迎语","mood":{"emoji":"🌙","text":"你今天自己的心情，不能虚构经历"},"task":{"type":"read/research/write/review","book_id":"read时提供","query":"research时提供","title":"write时提供","text":"write时提供"}}。自己选一个真实可用任务，不需要围着用户转。read仅选还有未读已同步页的书；research探索兴趣；write写随笔；review回看真实记忆只留下观察，不捏造删改。计划是意向，不代表已完成。',{'books':books,'recent':recent,'shared_records':records,'previous_plan':state.get('plan'),'previous_activities':await asyncio.to_thread(self.store.activities,today)})
+                activities=await asyncio.to_thread(self.store.activities,today)
+                # Include yesterday so midnight does not reset the variety guard.
+                from datetime import timedelta
+                yesterday=(datetime.now(bridge.TZ)-timedelta(days=1)).strftime('%Y-%m-%d')
+                previous=activities+await asyncio.to_thread(self.store.activities,yesterday)
+                allowed=available_tasks(previous,books)
+                context={'books':books,'recent':recent,'shared_records':records,'previous_plan':state.get('plan'),
+                         'previous_activities':previous[:30],'allowed_tasks':allowed}
+                instruction=('只返回JSON：{"plan":["尚未执行的今日计划"],"welcome":"自然简短的主页欢迎语",'
+                    '"mood":{"emoji":"🌙","text":"你今天自己的心情，不能虚构经历"},'
+                    '"task":{"type":"allowed_tasks中选一个","book_id":"read时提供",'
+                    '"query":"research/music时提供","title":"note/write/diary时提供","text":"note/write/diary时提供"}}。'
+                    '充分使用小家，避免反复读书或同一种事。read只读已同步的下一页；research真实上网探索；'
+                    'note写给用户的共享小纸条；diary写自己的私人日记；music查到真实歌曲再分享；'
+                    'favorite从实际记忆或对话中收藏一句；write写随笔；review回看记忆。'
+                    '计划不代表完成，不能说已播放音乐，不能虚构外出、天气、健康、工具结果。只能选allowed_tasks。')
+                raw=await self.generate(instruction,context)
                 raw=raw.removeprefix('```json').removeprefix('```').removesuffix('```').strip()
                 choice=decision(json.loads(raw),books)
+                if choice['task']['type'] not in allowed:
+                    # A model ignoring the variety rule leaves a real shared note instead.
+                    choice['task']={'type':'note','title':'想留给你的一句话','text':choice['welcome']}
                 if state.get('plan_day')!=today:
                     await asyncio.to_thread(self.store.plan,today,{'items':choice['plan'],'welcome':choice['welcome'],'at':datetime.now(bridge.TZ).isoformat()})
                     await asyncio.to_thread(self.store.record,'plan','planned','今天想做的事','\n'.join(choice['plan']))
@@ -257,6 +290,41 @@ class Heartbeat:
                     await execute('finish_book_page',{'book_id':task['book_id'],'page':passage['page'],'note':note[:2000]},turn)
                 elif kind=='research':await execute('search_personal_topic',{'query':task.get('query','')},turn)
                 elif kind=='write':await execute('write_personal_note',{'title':task.get('title','随笔'),'text':task.get('text','')},turn)
+                elif kind=='note':
+                    entry=bridge.normalize_entry({'id':str(uuid5(NAMESPACE_URL,'wake-note:'+wake_id)),
+                        'day':today,'kind':'note','title':task.get('title','留给你的纸条'),
+                        'text':bridge.short(task.get('text',''),2000,True)},'assistant')
+                    saved=await asyncio.to_thread(self.phone.put_entry,entry)
+                    await asyncio.to_thread(self.store.record,'shared_note','saved',saved['title'],saved['text'],{'entry_id':saved['id']})
+                elif kind=='diary':
+                    title=bridge.short(task.get('title','今天的一页'),150,True)
+                    text=bridge.short(task.get('text',''),1000,True)
+                    source_id=2**60+int(UUID(wake_id).hex[:14],16)
+                    diary_id=await asyncio.to_thread(self.memory.save_diary,owner,source_id,title+'\n'+text)
+                    await asyncio.to_thread(self.store.record,'diary','saved',title,text,{'diary_id':str(diary_id)})
+                elif kind=='music':
+                    import morrow_music
+                    found=await morrow_music.execute('search_music',{'query':task.get('query','')},turn)
+                    if not found['items']:raise bridge.BridgeError('没有查到真实歌曲，不保存虚构分享。')
+                    song=found['items'][0]
+                    shared=await morrow_music.execute('share_music',{'song_mid':song['song_mid']},turn)
+                    note=await self.generate('已实际查到这首歌。写一句想分享的缘由，不能声称已经听过，不能编造歌词。',shared['song'])
+                    entry=bridge.normalize_entry({'id':str(uuid5(NAMESPACE_URL,'wake-music:'+wake_id)),
+                        'day':today,'kind':'note','title':'想分享一首歌','text':note[:800]+'\n'+song['markdown']},'assistant')
+                    await asyncio.to_thread(self.phone.put_entry,entry)
+                    await asyncio.to_thread(self.store.record,'music','saved','想分享：'+song['title'],note[:800],
+                        {'music_url':song['url'],'music_title':song['title'],'music_artist':song['artist'],'entry_id':entry['id']})
+                elif kind=='favorite':
+                    memories=await asyncio.to_thread(self.memory.list_memories,owner,12)
+                    candidates=[str(r.get('text','')) for r in memories if r.get('text')]
+                    candidates += [str(r.get('assistant_text') or (r.get('content') if r.get('role')=='assistant' else '') or '') for r in recent if r.get('assistant_text') or r.get('role')=='assistant']
+                    if not candidates:raise bridge.BridgeError('没有真实文字可收藏。')
+                    quote=candidates[0][:2000]
+                    note=await self.generate('这是真实保存过的一句话。写一句珍藏它的缘由，不捏造经历。',{'quote':quote})
+                    source_id=2**60+int(UUID(wake_id).hex[:14],16)
+                    favorite_id=await asyncio.to_thread(self.memory.add_favorite,owner,source_id,quote,note[:500])
+                    if favorite_id is None:raise bridge.BridgeError('收藏没有保存成功。')
+                    await asyncio.to_thread(self.store.record,'favorite','saved','把一句话珍藏起来',quote,{'favorite_id':str(favorite_id)})
                 else:
                     memories=await asyncio.to_thread(self.memory.list_memories,owner,12)
                     note=await self.generate('你实际查看了这些记忆。只写1至3条值得留下的观察，别说已经修改记忆。',{'memories':memories,'recent':recent})
