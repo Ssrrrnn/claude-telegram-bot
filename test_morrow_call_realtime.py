@@ -145,7 +145,7 @@ class RealtimeTests(unittest.IsolatedAsyncioTestCase):
                 await waiting.wait()
             finally: closed.set()
         with patch('morrow_call_realtime.sentence_stream', self.sentences), patch('morrow_call_realtime.pcm_stream', voice):
-            socket = await self.connect(); await socket.send_json(self.request)
+            socket = await self.connect(); await socket.send_json({**self.request, 'request_id': self.request['request_id'].upper(), 'session_id': self.request['session_id'].upper()})
             await self.until(socket, 'audio')
             await socket.send_json({'type':'interrupt','request_id':self.request['request_id']})
             await self.until(socket, 'interrupted')

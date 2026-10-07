@@ -271,8 +271,9 @@ class RealtimeCall:
                         raise CallError(400, '通话事件不正确。')
                     kind = data.get('type')
                     if kind == 'turn':
+                        rid = identifier(data.get('request_id'))
                         await self.cancel()
-                        self.current = data.get('request_id')
+                        self.current = rid
                         self.task = asyncio.create_task(self.perform(data))
                     elif kind == 'interrupt':
                         if set(data) != {'type', 'request_id'}:
