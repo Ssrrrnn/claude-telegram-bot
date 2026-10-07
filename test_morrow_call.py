@@ -36,9 +36,8 @@ class CallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['segments'], duplicate['segments'])
         self.assertTrue(duplicate['duplicate'])
         self.assertEqual(self.service.generate.await_count, 1)
-        self.assertEqual(len(self.saved), 1)
-        self.assertEqual(self.saved[0][0], 123)
-        self.assertIn('我在呢。', self.saved[0][-1])
+        self.assertFalse(self.saved, 'Call receipts must never enter chat history')
+        self.assertIn('我在呢。', self.gateway.store.get(self.request['request_id'])['result']['segments'][0]['zh'])
         fresh = CallService(self.gateway, self.heartbeat)
         self.assertTrue((await fresh.turn(self.request))['duplicate'])
 
@@ -111,7 +110,7 @@ class CallTests(unittest.IsolatedAsyncioTestCase):
         client = TestClient(TestServer(create_web_app(self.gateway, heartbeat=self.heartbeat)))
         await client.start_server()
         try:
-            for method, path in [('get','/v1/call/status'),('post','/v1/call/turn'),('post','/v1/call/audio')]:
+            for method, path in [('get','/v1/call/status'),('post','/v1/call/turn'),('post','/v1/call/audio'),('get','/v1/call/realtime')]:
                 response = await getattr(client, method)(path)
                 self.assertEqual(response.status, 401)
             response = await client.get('/v1/call/status', headers={'Authorization':'Bearer '+'a'*32})

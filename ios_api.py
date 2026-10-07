@@ -66,8 +66,11 @@ class Store:
     def history(self):
         with self.memory._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id,user_text,assistant_text FROM recent_conversation "
-                            "WHERE chat_id=%s ORDER BY id DESC LIMIT 40", (self.owner,))
+                cur.execute("SELECT id,user_text,assistant_text FROM recent_conversation c "
+                            "WHERE chat_id=%s AND NOT EXISTS (SELECT 1 FROM ios_requests r "
+                            "WHERE r.chat_id=c.chat_id AND r.user_text LIKE 'call:%%' "
+                            "AND c.telegram_message_id=4611686018427387904+r.id) "
+                            "ORDER BY id DESC LIMIT 40", (self.owner,))
                 rows = list(reversed(cur.fetchall()))
         messages = []
         for row in rows:
@@ -75,6 +78,16 @@ class Store:
                 if row.get(field):
                     messages.append({'id': f"{row['id']}:{role}", 'role': role, 'text': row[field]})
         return messages
+
+    def call_history(self, session_id):
+        # Calls retain their own context; no call turn is inserted into the chat feed.
+        with self.memory._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_text,result FROM ios_requests WHERE chat_id=%s "
+                            "AND user_text LIKE %s AND status IN ('done','interrupted') "
+                            "ORDER BY id DESC LIMIT 12", (self.owner, 'call:' + session_id + ':%'))
+                rows = list(reversed(cur.fetchall()))
+        return call_messages(rows)
 
     def assistant_id(self, message_id):
         with self.memory._connect() as conn:
@@ -113,6 +126,21 @@ class Store:
         more = len(rows) > limit
         return {'items': items, 'has_more': more,
                 'next_before': items[-1]['id'] if more and items else None}
+
+
+def call_messages(rows):
+    messages = []
+    for row in rows:
+        text = row['user_text'].split(':', 2)[-1]
+        if text != 'greeting':
+            messages.append({'role': 'user', 'content': text})
+        result = row.get('result') or {}
+        segments = result.get('segments', [])
+        indices = result.get('played_indices', list(range(len(segments))))
+        spoken = [segments[i] for i in indices if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(segments)]
+        if spoken:
+            messages.append({'role': 'assistant', 'content': '\n'.join(x['en'] for x in spoken)})
+    return messages[-24:]
 
 
 class APIError(Exception):
@@ -222,6 +250,21 @@ def create_web_app(gateway, phone=None, agent=None, heartbeat=None):
 
     async def call_status(request):
         return web.json_response(calls.status())
+
+    from morrow_call_realtime import RealtimeCall
+    realtime_lock = asyncio.Lock()
+
+    async def call_realtime(request):
+        if realtime_lock.locked():
+            raise APIError(409, '已经有一通电话在进行，请先挂断。')
+        if not calls.status()['configured']:
+            raise APIError(503, 'ElevenLabs 音色尚未配置。')
+        async with realtime_lock:
+            socket = web.WebSocketResponse(heartbeat=20, max_msg_size=8192)
+            socket.headers['Cache-Control'] = 'no-store'
+            await socket.prepare(request)
+            await RealtimeCall(calls, socket).run()
+            return socket
 
     async def call_request(request):
         raw = await request.read()
@@ -352,6 +395,7 @@ def create_web_app(gateway, phone=None, agent=None, heartbeat=None):
     app.router.add_get('/health', health)
     app.router.add_post('/v1/radio/speech', radio_speech)
     app.router.add_get('/v1/call/status', call_status)
+    app.router.add_get('/v1/call/realtime', call_realtime)
     app.router.add_post('/v1/call/turn', call_request)
     app.router.add_post('/v1/call/audio', call_request)
     app.router.add_get('/v1/browsing',browsing)
