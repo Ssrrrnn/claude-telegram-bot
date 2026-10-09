@@ -15,7 +15,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from urllib import error, request
 
@@ -144,21 +143,21 @@ def private_dir(workspace: Path) -> Path:
 
 
 def write_once(path: Path, content: str) -> bool:
-    """Never overwrite a prior issue revision; atomic file creation."""
-    if path.exists():
-        return False
+    """Create each issue revision exclusively; never replace an existing one."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".bridge-", dir=path.parent)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
-        if path.exists():
-            return False
-        os.replace(temporary, path)
-        return True
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return True
 
 
 def receive_tasks(workspace: Path, target: str, issues: list[dict]) -> list[Path]:
@@ -321,8 +320,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise BridgeError("Watch interval must be 30-3600 seconds")
             token = github_token()
             while True:
-                received = receive_tasks(workspace, args.target, list_open_issues(token))
-                print(f"Received {len(received)} new revision(s); inbox={workspace / '.morrow-harness' / 'inbox'}")
+                try:
+                    received = receive_tasks(workspace, args.target, list_open_issues(token))
+                    print(f"Received {len(received)} new revision(s); inbox={workspace / '.morrow-harness' / 'inbox'}")
+                except BridgeError as exc:
+                    if args.command == "poll":
+                        raise
+                    print(f"Bridge polling warning: {exc}; retrying", file=sys.stderr)
                 if args.command == "poll":
                     return 0
                 time.sleep(args.interval)
