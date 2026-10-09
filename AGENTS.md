@@ -13,7 +13,7 @@
 - 语言：Python（生产代码下限 3.10；测试套件因 `asyncio.timeout` 需 ≥3.11；本地验证使用 3.12.10）
 - 存储：PostgreSQL（生产唯一持久层）
 - 部署：Railway（主服务）+ 独立 NapCat 容器（QQ 网关）
-- 跟踪文件：63 个（全部为源码 / 测试 / 文档 / 必要配置）
+- 跟踪文件：64 个（全部为源码 / 测试 / 文档 / 必要配置）。本阶段再新增 5 个，提交后为 69 个：`egress_guard.py`、`test_egress_guard.py`、`.dockerignore`、`.github/ci/Dockerfile`、`.github/workflows/ci.yml`
 
 ---
 
@@ -81,7 +81,7 @@ Procfile: worker: python runner_20m.py ────────┘
 
 **本地开发一律使用 Morrow 模式**，或只运行单元测试。
 
-> ⚠️ **`Procfile` 中的 `worker: python runner_20m.py` 是过时残留**，与生产实际启动命令不一致。生产启动命令以 Railway 服务设置为准。
+> ⚠️ **`Procfile` 中的 `worker: python runner_20m.py` 已核实为不生效的过时残留**（见 §4.1）。生产实际由 Railway 服务的 Start Command 指定为 `python morrow_runtime.py`。**绝不要依据 `Procfile` 判断生产行为。**
 
 ---
 
@@ -95,6 +95,25 @@ python morrow_runtime.py
 - 健康检查路径：`GET /health`（免鉴权）。
 - **`IOS_APP_TOKEN` 缺失时 iOS API 不会启动**，`/health` 随之不存在，`morrow_runtime.py` 会抛出 `RuntimeError('Morrow API did not start')` 并退出。该变量是硬性启动依赖。
 - **不要在没有明确批准的情况下改动 Railway 的 Start Command 或 Procfile。**
+
+### 4.1 已核实的 Railway 生产配置（2026-10-09）
+
+| 项 | 值 |
+|---|---|
+| Production 服务 | `claude-telegram-bot` |
+| Source | `Ssrrrnn/claude-telegram-bot` |
+| 部署分支 | `main` |
+| **Start Command** | **`python morrow_runtime.py`** |
+| Healthcheck | `/health` |
+| `checkSuites` | **`false`** |
+
+**两条必须记住的结论**：
+
+1. **`Procfile` 中的 `worker: python runner_20m.py` 不生效。** 它此前被怀疑为过时残留，现已核实：生产由 Railway 服务的 Start Command 覆盖，与 `Procfile` 无关。**不要依据 `Procfile` 判断生产行为。**
+2. **`checkSuites: false` 意味着 Railway 完全忽略 GitHub 的检查结果。** 只要 `main` 有新提交就会部署 —— CI 状态对部署没有影响。因此：
+   - CI **不是**部署门禁，不能声称「CI 通过才部署」；
+   - **唯一有效门禁是 `main` 的分支保护**（要求 PR + 必需状态检查）；
+   - **直推 `main` 会绕过全部 CI 并立即触发生产部署。**
 
 ---
 
@@ -149,9 +168,11 @@ python morrow_runtime.py
 
 ### 8.1 测试套件概况
 
-- 18 个 `test_*.py`，共约 **218** 个用例，**全部基于标准库 `unittest`**（不使用 pytest，`pytest` 也未在 `requirements.txt` 声明）。
+- **19 个 `test_*.py`，共 236 个用例**（原有 18 个文件 218 用例，加新增的 `test_egress_guard.py` 18 用例），**全部基于标准库 `unittest`**（不使用 pytest，`pytest` 也未在 `requirements.txt` 声明）。
 - 异步用例使用 `unittest.IsolatedAsyncioTestCase`。
 - **无 `conftest.py`**；共享 fixture 通过**测试文件互相导入**实现（如 `test_ios_api.FakeStore`），因此**必须在仓库根目录运行**。
+- **本地实测：185 用例全部通过**（167 白名单 + 18 守卫自检；0 失败 / 0 跳过 / 0 非预期出网）。
+- **尚未执行：51 用例**，全部属于三个动态 `exec` 生产模块的文件（`test_proactive` 27、`test_realtime_clock` 12、`test_romance` 12）。
 
 ### 8.2 运行方式
 
@@ -185,6 +206,71 @@ python morrow_runtime.py
 ### 8.5 测试失败处理
 
 **只分析原因，不擅自修改生产代码。** 报告失败用例、断言内容、以及根因推断（附证据），等待批准后再修。
+
+### 8.6 出站守卫 `egress_guard.py`
+
+进程内守卫：在导入任何测试模块**之前**拦截 `socket.socket.connect` / `connect_ex` / `sendto` 与 `socket.getaddrinfo`，**只放行回环地址**（`127.0.0.0/8`、`::1`、`localhost`、`0.0.0.0`、`::`），并统计拦截次数。
+
+```powershell
+$py = 'D:\AI-Projects\Bot\.venvs\claude-telegram-bot\Scripts\python.exe'
+
+# 守卫自检（拒绝外部 / 放行回环 / 回环 IPv6）
+& $py egress_guard.py --selfcheck
+
+# 从仓库根目录运行指定 unittest 模块
+& $py egress_guard.py test_continuity test_qq test_voice …
+
+# 守卫自身的单元测试
+& $py egress_guard.py test_egress_guard
+```
+
+行为约定：
+- **非预期出网会使运行失败**：退出码非 0，并打印 `FAILING the run because unexpected egress was blocked`。
+- 刻意触发的探测（守卫自检）通过 `expecting_blocks()` 上下文标记，**不计入违规**。
+- 汇总行格式：`EGRESS-GUARD-SUMMARY unexpected=N deliberate=M tests=… failures=… errors=… skipped=…`。CI 应以此为准。
+- 仅记录**操作类型与目标主机**，不读取、不存储、不打印任何载荷、请求头、URL 查询串或凭据。
+
+> ⚠️ **局限（必须理解）**：`egress_guard.py` 是**防御纵深与探测器，不是操作系统级网络隔离**。它在 CPython 解释器内部运行，只能观测经过 `socket` 模块 Python 层入口的流量。它**拦不住**：
+> 1. 经 `subprocess` / `os.system` / `os.exec*` 派生的**子进程**；
+> 2. 不经 `socket` 模块、由 C 扩展直接调用 `connect(2)` 的**原生套接字**；
+> 3. 直接实例化 `_socket.socket` 从而绕过被补丁的 `socket.socket` 子类；
+> 4. Unix domain socket、文件、管道等非 IP 通道；
+> 5. 在 `install()` 执行**之前**就已建立的连接。
+>
+> **因此绝不能以它替代真正的隔离边界。** 权威的隔离边界是容器 `--network none`（见 §8.7）。
+
+### 8.7 GitHub Actions Docker CI（`.github/workflows/ci.yml`）
+
+CI 采用**两阶段容器方案**，配置文件：
+
+| 文件 | 作用 |
+|---|---|
+| `.github/ci/Dockerfile` | 两阶段镜像：`deps` 阶段联网装依赖；运行阶段非 root、无凭据 |
+| `.dockerignore` | 构建上下文过滤（**注意：`.gitignore` ≠ `.dockerignore`**） |
+| `.github/workflows/ci.yml` | 构建 → 隔离验证 → 守卫自检 → 白名单测试 |
+
+**阶段划分（不得混淆）**：
+
+1. **镜像构建阶段**：允许网络，仅用于 `pip install -r requirements.txt`。
+2. **测试阶段**：**所有** `docker run` 一律带上 `--network none`，容器只能访问回环。
+
+**容器加固基线**（在 workflow 的 `RUN_FLAGS` 中统一声明，所有 `docker run` 必须引用它）：
+
+```
+--network none --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m
+--user 10001:10001 --cap-drop ALL --security-opt no-new-privileges
+--pids-limit 256 --memory 1g --cpus 2
+```
+
+**强制规则**：
+- 测试阶段**必须**先运行「隔离验证」步骤：在**不装 Python 守卫**的前提下（否则守卫会掩盖缺失的网络边界，造成假通过）验证**回环可用、外部不可达**。该步骤失败即整个 job 失败。
+- **禁止静默降级**：不得为跑通而在测试阶段去掉 `--network none`；不得使用 `continue-on-error`。
+- **禁止依赖未经验证的 `sudo unshare --net`**。
+- Docker 在 runner 上不可用时，`Preflight` 步骤直接失败并标记为阻塞项，等待人工决策。
+- 状态检查名称固定为 **`hermetic-tests`**（job 名与 job 级 `name` 均为该值）。
+
+**当前 CI 白名单**：15 个已本地验证文件（167 用例）+ `test_egress_guard.py`（18 用例）= **185 用例**。
+**明确排除**：`test_proactive.py`、`test_realtime_clock.py`、`test_romance.py`（动态 `exec` 生产模块，需独立隔离任务，见 §8.3）。
 
 ---
 
@@ -256,6 +342,8 @@ python morrow_runtime.py
 10. 修改系统 PATH 或系统环境变量。
 11. 未获批准自行创建文件（报告类产出先在会话中展示）。
 12. 自动 commit。
+13. **让 CI 自动发布** —— CI **禁止**包含任何部署步骤，禁止调用 Railway（`railway up` / `redeploy`），禁止写入仓库、创建 tag/release、合并 PR 或修改分支。CI 只允许 `permissions: contents: read`。
+14. **静默削弱 CI 隔离** —— 不得为了跑通测试而去掉测试容器的 `--network none`、不得添加 `continue-on-error` 掩盖隔离验证失败。
 
 ---
 
@@ -288,7 +376,7 @@ python morrow_runtime.py
 | # | 陷阱 | 证据 |
 |---|---|---|
 | 1 | `runner_20m.py` 直接运行会启动 Telegram 轮询 + QQ | `runner_20m.py:667-668` → `runner.py:716` |
-| 2 | `Procfile` 与生产启动命令不一致 | `Procfile` vs `MORROW.md:9` |
+| 2 | **`Procfile` 不生效**（2026-10-09 已核实）——生产由 Railway 服务的 Start Command 指定为 `python morrow_runtime.py` | `Procfile` vs §4.1 |
 | 3 | `IOS_APP_TOKEN` 缺失导致进程退出（`/health` 随之消失） | `ios_api.py:424-426`、`morrow_runtime.py:18-19` |
 | 4 | `morrow_runtime.py:1` 的 docstring 声称「without Telegram polling」，但导入的 `runner_20m` 在 `__main__` 下会轮询 | `morrow_runtime.py:1` |
 | 5 | `bot.py` 的 SQLite 实现已被 `memory_pg` 覆盖，属死代码 | `runner.py:22-30` |
