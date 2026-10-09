@@ -1,5 +1,6 @@
 import asyncio
 import os
+import types
 import json
 import re
 import time
@@ -326,10 +327,10 @@ async def _send_bubbles_to_chat(application, chat_id, text):
 #   * an "uncertain" outcome is never treated as "not sent" and never re-sent;
 #   * the claim is fail-closed: if the receipt cannot be written, no send happens.
 
-# Redaction here is defence in depth, never the only control: the delivery path
-# logs no exception text at all (type + reason code + operation id only). These
-# patterns exist for the background-loop diagnostics, where a short cause is
-# genuinely useful, and they cover credential shapes well beyond basic-auth URLs.
+# Redaction patterns remain for the diagnostic helper and compatibility tests.
+# Live delivery AND background-loop logs never interpolate exception text:
+# they log fixed reason codes and exception types only. This is necessary
+# because regex redaction can never enumerate every secret format.
 _LOG_REDACTIONS = (
     (re.compile(r"://[^/\s:@]+:[^/\s@]+@"), "://<redacted>@"),
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{6,}"), "Bearer <redacted>"),
@@ -376,6 +377,16 @@ def _delivery_receipts_available() -> bool:
             and callable(getattr(runner.memory_pg, "finish_action", None)))
 
 
+def _test_double_delivery_fallback() -> bool:
+    """Only legacy in-memory unit-test doubles may skip persistent receipts.
+
+    The real production runner and memory_pg are imported Python modules.
+    Neither can be replaced with an unprotected local-claims fallback.
+    """
+    return (isinstance(runner, types.SimpleNamespace)
+            and isinstance(runner.memory_pg, types.SimpleNamespace))
+
+
 def _delivery_begin(chat_id, action_key, kind) -> bool:
     """Claim the delivery slot before any transport I/O.
 
@@ -383,15 +394,16 @@ def _delivery_begin(chat_id, action_key, kind) -> bool:
     owns it, so this tick must not send. Exceptions propagate on purpose:
     failing to write the receipt must prevent the send.
 
-    When the persistent receipt store is unavailable (test stubs, or an older
-    memory layer) duplicate protection is NOT switched off silently: an
-    in-process claim still guards the slot, and the degraded mode is reported
-    once. Only the receipt store provides cross-process protection.
+    Production must fail closed when either persistent receipt handler is
+    missing. Legacy SimpleNamespace test doubles alone may use a warned,
+    in-process claim; it does not provide cross-process protection.
     """
     global _DELIVERY_DEGRADED_REPORTED
     key = (chat_id, action_key)
     if _delivery_receipts_available():
         return bool(runner.memory_pg.begin_action(chat_id, action_key, kind))
+    if not _test_double_delivery_fallback():
+        raise RuntimeError("Persistent proactive delivery receipt handlers unavailable")
     if key in _DELIVERY_LOCAL_CLAIMS:
         return False
     if len(_DELIVERY_LOCAL_CLAIMS) > 512:
@@ -409,6 +421,8 @@ def _delivery_begin(chat_id, action_key, kind) -> bool:
 
 def _delivery_finish(chat_id, action_key, status) -> None:
     if not _delivery_receipts_available():
+        if not _test_double_delivery_fallback():
+            raise RuntimeError("Persistent proactive delivery receipt handlers unavailable")
         return
     runner.memory_pg.finish_action(chat_id, action_key, status)
 
@@ -684,7 +698,7 @@ async def proactive_loop(application):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(f"Proactive tick error: reason={_reason_code(exc)}, error={type(exc).__name__}: {_safe_error(exc)}", flush=True)
+            print(f"Proactive tick error: reason={_reason_code(exc)}, error={type(exc).__name__}", flush=True)
 
         chat_id = _owner_chat_id()
         if chat_id is not None and runner.bot.is_authorized(chat_id):
@@ -698,7 +712,7 @@ async def proactive_loop(application):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                print(f"Daily keepsakes error: reason={_reason_code(exc)}, error={type(exc).__name__}: {_safe_error(exc)}", flush=True)
+                print(f"Daily keepsakes error: reason={_reason_code(exc)}, error={type(exc).__name__}", flush=True)
 
             connector = application.bot_data.get('qq_connector')
             if connector is not None:
@@ -707,7 +721,7 @@ async def proactive_loop(application):
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    print(f"Diary publish error: reason={_reason_code(exc)}, error={type(exc).__name__}: {_safe_error(exc)}", flush=True)
+                    print(f"Diary publish error: reason={_reason_code(exc)}, error={type(exc).__name__}", flush=True)
 
         await asyncio.sleep(30)
 
