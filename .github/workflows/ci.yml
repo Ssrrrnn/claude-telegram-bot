@@ -99,7 +99,7 @@ jobs:
         run: docker run $RUN_FLAGS "$IMAGE" python egress_guard.py --selfcheck
 
       # Whitelist: the 15 test files verified locally (167 existing cases),
-      # plus test_egress_guard.py (18 cases) which validates the guard itself.
+      # plus test_egress_guard.py (18 cases) and network-mocked bridge tests.
       # The 3 deferred modules (test_proactive, test_realtime_clock,
       # test_romance) dynamically exec production modules and are deliberately
       # NOT run here.
@@ -111,7 +111,7 @@ jobs:
             test_morrow_call test_morrow_call_realtime test_morrow_radio \
             test_morrow_services test_morrow_activity_variety \
             test_qzone test_qq test_voice test_morrow_music \
-            test_egress_guard
+            test_egress_guard test_harness_bridge
 
 # NOTE ON DEPLOYMENT
 # ------------------
