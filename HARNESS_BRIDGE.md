@@ -26,6 +26,8 @@ ChatGPT 读取 Issue 继续审查。
   由 Ssrrrnn 创建、标题以 [Harness] 开头、含精确协议头的开放 Issue；
   GitHub PR、其他作者或不合格 Issue 一律忽略。
 - 运行任务前校验工作区确为 checkout，Git 分支不能是 main/master 或 detached。
+- 每次 run 都使用 GitHub 认证**重新检查远程 Issue 仍 open、作者和正文修订一致**；
+  如果任务在领取后已取消或修改，拒绝执行，先重新 poll。
 - 任务正文经标准输入传给 DeepSeek 官方 headless，**不会经 shell 拼接执行**。
 - 结果和 Harness stderr **只保存本地忽略目录**，不会自动上传 GitHub。
   私人聊天、密钥、模型推理日志绝对不要粘到 Issue。
@@ -151,6 +153,9 @@ headless 也可能使用**与现有桌面版不同**的模型配置或 Session�
 implement 类型额外需要 --allow-writes，并要求本地已在安全开发分支：
 
     & $py "$repo\harness_bridge.py" run 55 --approve-local-run --allow-writes --runner dsh
+
+运行时还需要当前 PowerShell 会话具有 GitHub Issue 读取认证，
+因为桥接会先检查远程任务是否仍有效，不能离线执行已取消的旧任务。
 
 **务必先在 DSH 内确认其 Workspace 沙箱和审批设置。**
 headless 是无交互一次性运行，可能不适合需要逐项弹窗批准的开发任务；
