@@ -190,6 +190,16 @@ def latest_task(workspace: Path, target: str, issue_number: int) -> tuple[dict, 
     return task, path
 
 
+def verify_live_task(task: dict, token: str) -> None:
+    """Fail closed if an issue was closed, edited, reassigned, or revoked."""
+    current = github_api(f"/repos/{QUEUE_REPO}/issues/{task['issue']}", token)
+    verified = parse_issue(current)
+    if (verified is None or verified["revision"] != task["revision"]
+            or verified["target"] != task["target"]
+            or verified["mode"] != task["mode"]):
+        raise BridgeError("Task revoked or edited on GitHub; poll the latest issue revision")
+
+
 def git_branch(workspace: Path) -> str:
     git = shutil.which("git")
     if not git and os.name == "nt":
@@ -342,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise BridgeError("Implement tasks additionally require --allow-writes")
             if args.timeout < 60 or args.timeout > 14400:
                 raise BridgeError("Timeout must be 60-14400 seconds")
+            verify_live_task(task, github_token())
             code, artifact = run_task(
                 task, workspace, runner=args.runner,
                 executable=args.executable, timeout=args.timeout,
