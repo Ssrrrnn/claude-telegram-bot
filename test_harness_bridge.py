@@ -133,6 +133,21 @@ class FilesystemTests(unittest.TestCase):
         self.assertEqual(code, 2)
         api_mock.assert_not_called()
 
+    def test_watch_retries_transient_api_error_without_execution(self):
+        """A temporary API failure should not kill the receiving watcher."""
+        with patch.object(bridge, "github_token", return_value="FIXTURE"), \
+             patch.object(bridge, "list_open_issues",
+                          side_effect=[bridge.BridgeError("Cannot reach GitHub API"), [issue()]]), \
+             patch.object(bridge.time, "sleep", side_effect=[None, KeyboardInterrupt()]), \
+             patch.object(bridge, "run_task") as run_mock, \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = bridge.main(["--workspace", str(self.workspace),
+                                "watch", "--interval", "60"])
+        self.assertEqual(code, 130)
+        run_mock.assert_not_called()
+        task, _ = bridge.latest_task(self.workspace, "backend", 81)
+        self.assertEqual(task["issue"], 81)
+
     def test_api_disallows_arbitrary_destination(self):
         with self.assertRaises(bridge.BridgeError):
             bridge.github_api("/repos/other/other/issues", "FAKE")
