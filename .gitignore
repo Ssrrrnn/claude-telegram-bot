@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -32,3 +32,19 @@ logs/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local SQLite databases
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# NapCat runtime data and credentials
+napcat/config/
+napcat/data/
+
+# Sessions and signing credentials
+*.session
+*.session-journal
+*.p12
+*.mobileprovision
