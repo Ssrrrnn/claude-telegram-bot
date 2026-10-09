@@ -1,0 +1,123 @@
+name: ci
+
+# Pull-request triggered only.
+#   * No `push` trigger: pushing `main` is what deploys production, and this
+#     workflow must never be the thing that starts a deployment.
+#   * No `pull_request_target`: that variant runs with a privileged token and
+#     is not needed here.
+#   * `workflow_dispatch` exists so a maintainer can re-run the check by hand.
+on:
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: read the repository, nothing else.  No `contents: write`,
+# no `deployments`, no `id-token`, no secrets.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: companion-hermetic-tests:ci
+  # Hardening flags shared by every container start.
+  RUN_FLAGS: >-
+    --rm
+    --network none
+    --read-only
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m
+    --user 10001:10001
+    --cap-drop ALL
+    --security-opt no-new-privileges
+    --pids-limit 256
+    --memory 1g
+    --cpus 2
+
+jobs:
+  # This job name is the required status check: "hermetic-tests".
+  hermetic-tests:
+    name: hermetic-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Do not leave the GITHUB_TOKEN in .git/config: no later step needs
+          # to push, and the job must not be able to write to the repository.
+          persist-credentials: false
+
+      # Fail loudly instead of silently skipping isolation when Docker is
+      # missing on the runner.
+      - name: Preflight - Docker must be available
+        run: docker version
+
+      # ---- Phase A: image build (network allowed, dependencies only) -------
+      - name: Build test image
+        run: docker build --file .github/ci/Dockerfile --tag "$IMAGE" .
+
+      # ---- Phase B: prove the container really is isolated -----------------
+      # Runs WITHOUT the Python guard on purpose: a Python-level block would
+      # mask a missing network boundary and turn this into a false pass.
+      - name: Verify network isolation (loopback up, external unreachable)
+        run: |
+          docker run $RUN_FLAGS -i "$IMAGE" python - <<'PY'
+          import socket
+          import sys
+
+          # 1. loopback must be usable -- aiohttp test servers need it.
+          server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          server.bind(('127.0.0.1', 0))
+          server.listen(1)
+          port = server.getsockname()[1]
+          conn = socket.create_connection(('127.0.0.1', port), timeout=5)
+          conn.close()
+          server.close()
+          print('isolation: loopback reachable on 127.0.0.1:%d' % port)
+
+          # 2. every external destination must be unreachable.  Raw IPs are
+          #    used so a DNS outage cannot be mistaken for isolation.
+          reachable = []
+          for host, target_port in (('1.1.1.1', 80), ('8.8.8.8', 53), ('93.184.216.34', 80)):
+              try:
+                  socket.create_connection((host, target_port), timeout=5).close()
+              except OSError as exc:
+                  print('isolation: %s:%d blocked (%s)' % (host, target_port, type(exc).__name__))
+                  continue
+              reachable.append('%s:%d' % (host, target_port))
+
+          if reachable:
+              print('isolation: FAILED - external network reachable: ' + ', '.join(reachable))
+              sys.exit(1)
+          print('isolation: OK - loopback only')
+          PY
+
+      # ---- Phase C: hermetic test execution (no external network) ----------
+      - name: Guard self-check
+        run: docker run $RUN_FLAGS "$IMAGE" python egress_guard.py --selfcheck
+
+      # Whitelist: the 15 test files verified locally (167 existing cases),
+      # plus test_egress_guard.py (18 cases) which validates the guard itself.
+      # The 3 deferred modules (test_proactive, test_realtime_clock,
+      # test_romance) dynamically exec production modules and are deliberately
+      # NOT run here.
+      - name: Hermetic tests
+        run: |
+          docker run $RUN_FLAGS "$IMAGE" python egress_guard.py \
+            test_companion_features test_continuity test_new_features \
+            test_ios_api test_companion_agent test_phone_bridge \
+            test_morrow_call test_morrow_call_realtime test_morrow_radio \
+            test_morrow_services test_morrow_activity_variety \
+            test_qzone test_qq test_voice test_morrow_music \
+            test_egress_guard
+
+# NOTE ON DEPLOYMENT
+# ------------------
+# This workflow contains NO deployment step and never writes to the repository.
+# Railway deploys the `main` branch of Ssrrrnn/claude-telegram-bot with
+# `python morrow_runtime.py`, and its `checkSuites` setting is `false`, so
+# Railway does NOT wait for this check.  This workflow can therefore only act
+# as a gate if `main` branch protection requires the `hermetic-tests` status
+# check before merge.  Direct pushes to `main` bypass it entirely.

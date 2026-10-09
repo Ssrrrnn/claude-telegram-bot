@@ -1,0 +1,85 @@
+# Docker build context filter for the hermetic test image.
+#
+# NOTE: .gitignore is NOT .dockerignore.  This file is intentionally explicit
+# and lists sensitive / irrelevant paths directly, so that the build context
+# never carries credentials, local databases, QQ login data, virtualenvs or
+# build artefacts into an image layer.
+#
+# Source code, tests and requirements.txt are deliberately KEPT.
+
+# --- VCS metadata ---------------------------------------------------------
+.git
+.gitignore
+.gitattributes
+
+# --- Secrets and environment ---------------------------------------------
+.env
+.env.*
+secrets/
+*.pem
+*.key
+*.p12
+*.mobileprovision
+*.keystore
+id_rsa*
+id_ed25519*
+
+# --- Local databases ------------------------------------------------------
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# --- Sessions -------------------------------------------------------------
+*.session
+*.session-journal
+
+# --- QQ / NapCat runtime state -------------------------------------------
+napcat/config/
+napcat/data/
+napcat/cache/
+napcat/logs/
+
+# --- Virtual environments -------------------------------------------------
+.venv/
+.venvs/
+venvs/
+venv/
+env/
+ENV/
+
+# --- Python caches and build output --------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- Logs -----------------------------------------------------------------
+*.log
+logs/
+
+# --- iOS build artefacts and signing --------------------------------------
+ios/build/
+*.xcodeproj/
+*.xcworkspace/
+*.ipa
+DerivedData/
+
+# --- Editors and OS noise -------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*~

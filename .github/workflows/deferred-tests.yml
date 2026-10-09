@@ -1,0 +1,92 @@
+# Isolated regression check for the three previously deferred test modules.
+# Does not deploy, merge, or modify protected main.
+name: deferred-isolated-tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deferred-isolated-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: companion-deferred-tests:ci
+  RUN_FLAGS: >-
+    --rm
+    --network none
+    --read-only
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m
+    --user 10001:10001
+    --cap-drop ALL
+    --security-opt no-new-privileges
+    --pids-limit 256
+    --memory 1g
+    --cpus 2
+
+jobs:
+  deferred-isolated-tests:
+    name: deferred-isolated-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Docker preflight
+        run: docker version
+
+      # Network access here is only for installing dependencies into the image.
+      - name: Build test image
+        run: docker build --file .github/ci/Dockerfile --tag "$IMAGE" .
+
+      # Independent of egress_guard: confirm the Docker network boundary first.
+      - name: Verify isolated network before running deferred tests
+        run: |
+          docker run $RUN_FLAGS -i "$IMAGE" python - <<'PY'
+          import socket
+          import sys
+
+          listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          listener.bind(("127.0.0.1", 0))
+          listener.listen(1)
+          port = listener.getsockname()[1]
+          connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+          connection.close()
+          listener.close()
+          print("isolation: IPv4 loopback reachable")
+
+          for host, target_port in (("1.1.1.1", 80), ("8.8.8.8", 53), ("93.184.216.34", 80)):
+              try:
+                  connection = socket.create_connection((host, target_port), timeout=3)
+              except OSError as exc:
+                  print(f"isolation: {host}:{target_port} blocked ({type(exc).__name__})")
+              else:
+                  connection.close()
+                  print(f"isolation: FAILED external connection to {host}:{target_port}")
+                  sys.exit(1)
+
+          print("isolation: OK - loopback only")
+          PY
+
+      - name: Guard self-check
+        run: docker run $RUN_FLAGS "$IMAGE" python egress_guard.py --selfcheck
+
+      # Run the dynamic-import modules in three separate, networkless containers.
+      # Any failure or unexpected Python-level egress returns nonzero and fails CI.
+      - name: Proactive regression - 27 cases
+        run: docker run $RUN_FLAGS "$IMAGE" python egress_guard.py test_proactive
+
+      - name: Realtime clock regression - 12 cases
+        run: docker run $RUN_FLAGS "$IMAGE" python egress_guard.py test_realtime_clock
+
+      - name: Romance regression - 12 cases
+        run: docker run $RUN_FLAGS "$IMAGE" python egress_guard.py test_romance
+
+# This is a non-required diagnostic check on PR #53 until its safety and
+# stability have been demonstrated. Never remove --network none to make it pass.
