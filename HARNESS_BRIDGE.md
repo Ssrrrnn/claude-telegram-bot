@@ -118,6 +118,17 @@ Target 允许 backend 或 ios；Mode 只允许 diagnose 或 implement。
 并把任务记录到 .morrow-harness/inbox/。修改 Issue 正文会创建新版本，
 不会覆盖历史版本。所有本地任务与日志均被 .gitignore 排除。
 
+### Windows 一键启动接收器
+
+完成上述 Git 同步后，也可以直接执行开发分支中的 PowerShell 启动脚本：
+
+    & "$repo\start-harness-bridge.ps1"
+
+它使用既有项目 Python 虚拟环境，必要时用隐藏输入读取 GitHub Token，
+并持续运行 watch。**不会**调用 Harness、修改代码或自动部署。
+如果机器的 PowerShell 策略不允许执行 .ps1，使用上文的 Python watch
+命令即可，不需要改变系统执行策略。
+
 ## 5. 人工批准后调用 DeepSeek Harness
 
 DeepSeek Harness 官方提供一次性 headless 模式。
