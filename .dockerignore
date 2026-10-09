@@ -83,3 +83,6 @@ DerivedData/
 Thumbs.db
 *.swp
 *~
+
+# Never ship local Harness task bodies or execution logs in Docker context
+.morrow-harness/

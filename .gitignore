@@ -48,3 +48,6 @@ napcat/data/
 *.session-journal
 *.p12
 *.mobileprovision
+
+# Local GitHub Issues -> Harness inbox; never commit task bodies or results
+.morrow-harness/
