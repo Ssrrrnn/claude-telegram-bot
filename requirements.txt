@@ -5,3 +5,6 @@ edge-tts==7.2.8
 websockets>=14,<17
 Pillow>=11,<13
 aiohttp>=3.11,<4
+# zoneinfo needs an IANA database. Windows and slim Linux images have none, so
+# the first-party tzdata package is what makes ZoneInfo("Asia/Shanghai") work.
+tzdata>=2024.1,<2030

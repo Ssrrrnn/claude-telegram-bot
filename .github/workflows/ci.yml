@@ -98,11 +98,15 @@ jobs:
       - name: Guard self-check
         run: docker run $RUN_FLAGS "$IMAGE" python egress_guard.py --selfcheck
 
-      # Whitelist: the 15 test files verified locally (167 existing cases),
-      # plus test_egress_guard.py (18 cases) which validates the guard itself.
+      # Whitelist: the 15 original test files (167 cases), test_egress_guard.py
+      # (18 cases) which validates the guard itself, and
+      # test_proactive_reliability.py (21 cases) covering the P0 proactive
+      # delivery-receipt, task-isolation and goodnight/morning fixes.
+      # test_proactive_reliability is listed LAST: it imports the real runner
+      # chain, and running it last keeps that side effect away from the others.
       # The 3 deferred modules (test_proactive, test_realtime_clock,
-      # test_romance) dynamically exec production modules and are deliberately
-      # NOT run here.
+      # test_romance) dynamically exec production modules and run in the
+      # separate, networkless `deferred-isolated-tests` workflow instead.
       - name: Hermetic tests
         run: |
           docker run $RUN_FLAGS "$IMAGE" python egress_guard.py \
@@ -111,7 +115,7 @@ jobs:
             test_morrow_call test_morrow_call_realtime test_morrow_radio \
             test_morrow_services test_morrow_activity_variety \
             test_qzone test_qq test_voice test_morrow_music \
-            test_egress_guard
+            test_egress_guard test_proactive_reliability
 
 # NOTE ON DEPLOYMENT
 # ------------------

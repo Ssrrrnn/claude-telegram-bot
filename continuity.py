@@ -4,8 +4,50 @@ import json
 import re
 import time
 import uuid
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 KEY = "conversation_continuity_v1"
+TZ = ZoneInfo("Asia/Shanghai")
+
+# status["value"] markers for the two distinct kinds of proactive pause.
+#   SLEEP - a plain goodnight. The next morning greeting is still allowed.
+#   REST  - an explicit "leave me alone / I am sleeping in" request, which
+#           outranks the morning greeting until it lapses.
+SLEEP_PAUSE_VALUE = "已说晚安，暂停主动打扰"
+REST_PAUSE_VALUE = "已要求延长休息，暂停主动打扰"
+
+# Explicit requests for extended rest / no contact. Matched with fullmatch on
+# the whole (punctuation- and space-stripped) message ONLY, so a partial or
+# fuzzy match can never widen a pause -- nor silently cancel one. Pattern 3
+# deliberately requires the object "我" and a limiter, so a bare "别打扰他"
+# or "不要联系别人" never creates a pause.
+_REST_REQUEST_RE = re.compile(
+    r"(?:"
+    r"(?:明天|明早|今天)?(?:早上|上午|一早|早)(?:都|先|就|也)?"
+    r"(?:不要|别|不用|不需要|不想)(?:再)?(?:联系|找|打扰|叫|吵)(?:我)?"
+    r"|"
+    r"(?:我)?(?:要|想|准备|打算)?(?:睡到|睡)中午(?:再|才)?(?:说|联系|找我|起)?"
+    r"|"
+    r"(?:今天|暂时|先|这几天|这段时间)?(?:都|就)?"
+    r"(?:不要|别|不用|不需要)(?:再)?(?:联系|找|打扰)我"
+    r")"
+    r"(?:了|吧|哦|啊|喔|啦)?"
+)
+
+
+def rest_request(text):
+    """True only for an explicit, well-formed rest / do-not-disturb request."""
+    stripped = re.sub(r"[\s。！!～~,.，、]+", "", text or "")
+    return bool(stripped) and bool(_REST_REQUEST_RE.fullmatch(stripped))
+
+
+def rest_expiry(now):
+    """A rest request covers the coming morning and lapses at 12:00 local."""
+    target = datetime.fromtimestamp(now, TZ).replace(hour=12, minute=0, second=0, microsecond=0)
+    if target.timestamp() <= now:
+        target = target + timedelta(days=1)
+    return target.timestamp()
 
 
 def empty():
@@ -37,9 +79,14 @@ def receive_state(state, text, message_id, now):
                 item.update(status="done", resolved_by=text[:300])
     elif re.search(r"(?:我)?(?:还在|正在|今天要|今晚要|又要)加班|(?:还在|我在)工作|我去上班了", text):
         status = {"value": "正在工作或加班", "source": text[:300], "expires_at": now + 12 * 3600}
-    if re.fullmatch(r"(?:我)?(?:先)?(?:睡了|去睡了|要睡了)[。！!～~]*|晚安[。！!～~]*", text):
-        status = {"value": "已说晚安，暂停主动打扰", "source": text[:300], "expires_at": now + 8 * 3600}
-    elif status.get("value") == "已说晚安，暂停主动打扰":
+    if rest_request(text):
+        # An explicit request for extended rest outranks everything else: it is
+        # never shortened, and an ordinary later turn does not silently cancel
+        # it -- it lapses on its own at 12:00 local.
+        status = {"value": REST_PAUSE_VALUE, "source": text[:300], "expires_at": rest_expiry(now)}
+    elif re.fullmatch(r"(?:我)?(?:先)?(?:睡了|去睡了|要睡了)[。！!～~]*|晚安[。！!～~]*", text):
+        status = {"value": SLEEP_PAUSE_VALUE, "source": text[:300], "expires_at": now + 8 * 3600}
+    elif status.get("value") == SLEEP_PAUSE_VALUE:
         status = {}  # A new user turn means conversation can resume.
     state["status"] = status
     if status and status.get("expires_at", 0) <= now:

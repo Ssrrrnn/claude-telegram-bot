@@ -311,6 +311,108 @@ async def _send_bubbles_to_chat(application, chat_id, text):
         await application.bot.send_message(chat_id=chat_id, text=bubble)
 
 
+# -----------------------------
+# Proactive delivery receipts
+# -----------------------------
+# A proactive message has no user-visible failure path: in Morrow mode the
+# "delivery" is a committed shared-history row, and there is no push channel.
+# These helpers persist an attempt/success/uncertain/failed receipt in the
+# existing companion_actions table (UNIQUE(chat_id, action_key)) so a lost
+# contact becomes observable instead of silent.
+#
+# Design constraints kept intact:
+#   * the cooldown is still written BEFORE delivery (line ~459), so a transport
+#     that accepted the message and then timed out is never re-sent;
+#   * an "uncertain" outcome is never treated as "not sent" and never re-sent;
+#   * the claim is fail-closed: if the receipt cannot be written, no send happens.
+
+# Redaction here is defence in depth, never the only control: the delivery path
+# logs no exception text at all (type + reason code + operation id only). These
+# patterns exist for the background-loop diagnostics, where a short cause is
+# genuinely useful, and they cover credential shapes well beyond basic-auth URLs.
+_LOG_REDACTIONS = (
+    (re.compile(r"://[^/\s:@]+:[^/\s@]+@"), "://<redacted>@"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{6,}"), "Bearer <redacted>"),
+    (re.compile(r"(?i)\b(?:sk|pk|ghp|gho|ghs|github_pat|xox[abprs])[_\-][A-Za-z0-9._\-]{6,}"), "<redacted>"),
+    (re.compile(r"(?i)\b(api[_-]?key|apikey|access[_-]?key|secret[_-]?key|token|secret|password|passwd|pwd)"
+                r"(\s*[=:]\s*)[^\s&,;'\"]+"), r"\1\2<redacted>"),
+    (re.compile(r"(?i)([?&](?:token|key|api_key|apikey|access_token|secret|password)=)[^&\s]+"), r"\1<redacted>"),
+)
+
+# Fixed, non-sensitive reason codes derived from the exception *type* only.
+_REASON_CODES = (
+    (asyncio.CancelledError, "cancelled"),
+    (TimeoutError, "timeout"),
+    (ConnectionError, "transport"),
+    (OSError, "transport"),
+    (ValueError, "bad-value"),
+    (KeyError, "bad-state"),
+    (RuntimeError, "runtime"),
+)
+
+_DELIVERY_LOCAL_CLAIMS = set()
+_DELIVERY_DEGRADED_REPORTED = False
+
+
+def _safe_error(exc) -> str:
+    """Log-safe description of *exc*: credentials redacted, length bounded."""
+    text = str(exc)
+    for pattern, replacement in _LOG_REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text[:400]
+
+
+def _reason_code(exc) -> str:
+    """Fixed reason code for *exc*, derived from its type and never its text."""
+    for exc_type, code in _REASON_CODES:
+        if isinstance(exc, exc_type):
+            return code
+    return "error"
+
+
+def _delivery_receipts_available() -> bool:
+    """True when the memory layer can persist delivery receipts."""
+    return (callable(getattr(runner.memory_pg, "begin_action", None))
+            and callable(getattr(runner.memory_pg, "finish_action", None)))
+
+
+def _delivery_begin(chat_id, action_key, kind) -> bool:
+    """Claim the delivery slot before any transport I/O.
+
+    Returns False when this exact slot was already claimed, i.e. another attempt
+    owns it, so this tick must not send. Exceptions propagate on purpose:
+    failing to write the receipt must prevent the send.
+
+    When the persistent receipt store is unavailable (test stubs, or an older
+    memory layer) duplicate protection is NOT switched off silently: an
+    in-process claim still guards the slot, and the degraded mode is reported
+    once. Only the receipt store provides cross-process protection.
+    """
+    global _DELIVERY_DEGRADED_REPORTED
+    key = (chat_id, action_key)
+    if _delivery_receipts_available():
+        return bool(runner.memory_pg.begin_action(chat_id, action_key, kind))
+    if key in _DELIVERY_LOCAL_CLAIMS:
+        return False
+    if len(_DELIVERY_LOCAL_CLAIMS) > 512:
+        _DELIVERY_LOCAL_CLAIMS.clear()
+    _DELIVERY_LOCAL_CLAIMS.add(key)
+    if not _DELIVERY_DEGRADED_REPORTED:
+        _DELIVERY_DEGRADED_REPORTED = True
+        print(
+            "Proactive delivery receipts unavailable: duplicate protection is "
+            "in-process only (no cross-process guard)",
+            flush=True,
+        )
+    return True
+
+
+def _delivery_finish(chat_id, action_key, status) -> None:
+    if not _delivery_receipts_available():
+        return
+    runner.memory_pg.finish_action(chat_id, action_key, status)
+
+
 def _first_morning_contact(chat_id):
     """The first scheduled contact after quiet hours should reach the owner."""
     now_local = _now_local()
@@ -429,9 +531,23 @@ async def _proactive_tick(application):
         return
     continuity_state = continuity.load(runner.memory_pg, chat_id)
     status = continuity_state["status"]
-    if status.get("value") == "已说晚安，暂停主动打扰" and status.get("expires_at", 0) > now:
-        runner.memory_pg.set_setting(chat_id, KEY_NEXT_AT, str(int(status["expires_at"])))
-        return
+    if status.get("expires_at", 0) > now:
+        value = status.get("value")
+        if value == continuity.REST_PAUSE_VALUE:
+            # The owner explicitly asked for extended rest / no contact. That
+            # request outranks the morning greeting and is never shortened.
+            runner.memory_pg.set_setting(chat_id, KEY_NEXT_AT, str(int(status["expires_at"])))
+            return
+        if value == continuity.SLEEP_PAUSE_VALUE and not morning_due:
+            # The 8-hour goodnight pause would otherwise cover the whole
+            # 08:45-10:30 morning window (a 02:30 goodnight expires at 10:30),
+            # silently costing the day's only morning greeting. A *due* morning
+            # greeting is the one exception: it is light, already consented and
+            # never assumes the user is awake. Every other contact still waits
+            # out the pause, and an explicit REST request (handled above)
+            # always wins over this exception.
+            runner.memory_pg.set_setting(chat_id, KEY_NEXT_AT, str(int(status["expires_at"])))
+            return
     # Serialize with normal replies; incoming text is recorded before generation.
     async with runner.bot.chat_locks[chat_id]:
         last_user_at = int(read(KEY_LAST_USER_AT) or 0)
@@ -462,42 +578,78 @@ async def _proactive_tick(application):
             runner.memory_pg.set_setting(chat_id, milestones.LAST_SENT_KEY, now_local.date().isoformat())
         if kind.startswith("回访:") and not continuity.claim_followup(runner.memory_pg, chat_id, kind.split(":", 1)[1]):
             return
-        voice_mode = voice_output.mode(runner.memory_pg.get_setting, chat_id)
-        send_as_voice = (voice_output.wants_audio(voice_mode, proactive=True) or
-                         (voice_mode == "auto" and voice_output.auto_spontaneous(
-                             runner.memory_pg.get_setting, chat_id, reply_text=text,
-                             proactive=True, unanswered=state["silence_count"] > 0)))
-        platform = "ios" if os.getenv("MORROW_ONLY") == "1" else (read(qq_connector.PLATFORM_KEY) or "telegram")
-        sent_as_voice = False
-        if platform == "ios":
-            # A committed shared-history row is the durable app inbox. No external send.
-            await asyncio.to_thread(runner.memory_pg.save_recent_proactive, chat_id, text)
-        if platform == "qq":
-            connector = application.bot_data.get("qq_connector")
-            if connector is None or connector.ws is None:
-                print(f"QQ proactive unavailable: chat_id={chat_id}, falling back to Telegram", flush=True)
-                platform = "telegram"
-            else:
-                sent_as_voice = await connector.send_proactive(
-                    text, strict_split_bubbles(text), as_voice=send_as_voice,
-                )
-        if platform not in ("qq", "ios"):
-            voice_key = f'telegram:proactive_voice:{int(now)}'
-            begin_action = getattr(runner.memory_pg, 'begin_action', None)
-            finish_action = getattr(runner.memory_pg, 'finish_action', None)
-            voice_claimed = send_as_voice and (begin_action(
-                chat_id, voice_key, 'Telegram主动语音') if begin_action else True)
-            try:
-                sent_as_voice = bool(voice_claimed) and await voice_output.send_voice(
-                    application.bot, chat_id, text, get_setting=runner.memory_pg.get_setting)
-            except Exception:
+        # Claim the delivery slot before any transport I/O. Fail-closed: if the
+        # receipt cannot be written the exception propagates and nothing is sent.
+        # A slot already claimed by another attempt means this tick must not send.
+        receipt_key = f"proactive:{int(now)}"
+        if not _delivery_begin(chat_id, receipt_key, kind):
+            # Another attempt owns this slot. Reschedule instead of returning
+            # bare, otherwise a duplicate instance would regenerate a message
+            # every 30 seconds only to discard it.
+            print(f"Proactive delivery already claimed: chat_id={chat_id}, key={receipt_key}", flush=True)
+            _schedule_from_now(chat_id)
+            return
+        delivery_attempted = False
+        try:
+            voice_mode = voice_output.mode(runner.memory_pg.get_setting, chat_id)
+            send_as_voice = (voice_output.wants_audio(voice_mode, proactive=True) or
+                             (voice_mode == "auto" and voice_output.auto_spontaneous(
+                                 runner.memory_pg.get_setting, chat_id, reply_text=text,
+                                 proactive=True, unanswered=state["silence_count"] > 0)))
+            platform = "ios" if os.getenv("MORROW_ONLY") == "1" else (read(qq_connector.PLATFORM_KEY) or "telegram")
+            sent_as_voice = False
+            if platform == "ios":
+                # A committed shared-history row is the durable app inbox. No external send.
+                delivery_attempted = True
+                await asyncio.to_thread(runner.memory_pg.save_recent_proactive, chat_id, text)
+            if platform == "qq":
+                connector = application.bot_data.get("qq_connector")
+                if connector is None or connector.ws is None:
+                    print(f"QQ proactive unavailable: chat_id={chat_id}, falling back to Telegram", flush=True)
+                    platform = "telegram"
+                else:
+                    delivery_attempted = True
+                    sent_as_voice = await connector.send_proactive(
+                        text, strict_split_bubbles(text), as_voice=send_as_voice,
+                    )
+            if platform not in ("qq", "ios"):
+                voice_key = f'telegram:proactive_voice:{int(now)}'
+                begin_action = getattr(runner.memory_pg, 'begin_action', None)
+                finish_action = getattr(runner.memory_pg, 'finish_action', None)
+                voice_claimed = send_as_voice and (begin_action(
+                    chat_id, voice_key, 'Telegram主动语音') if begin_action else True)
+                delivery_attempted = True
+                try:
+                    sent_as_voice = bool(voice_claimed) and await voice_output.send_voice(
+                        application.bot, chat_id, text, get_setting=runner.memory_pg.get_setting)
+                except Exception:
+                    if voice_claimed and finish_action:
+                        finish_action(chat_id, voice_key, 'uncertain')
+                    raise
                 if voice_claimed and finish_action:
-                    finish_action(chat_id, voice_key, 'uncertain')
-                raise
-            if voice_claimed and finish_action:
-                finish_action(chat_id, voice_key, 'success' if sent_as_voice else 'failed')
-            if not sent_as_voice:
-                await _send_bubbles_to_chat(application, chat_id, text)
+                    finish_action(chat_id, voice_key, 'success' if sent_as_voice else 'failed')
+                if not sent_as_voice:
+                    await _send_bubbles_to_chat(application, chat_id, text)
+        except asyncio.CancelledError:
+            _delivery_finish(chat_id, receipt_key, "uncertain")
+            raise
+        except Exception as exc:
+            # No transport call had started => the failure is definitive.
+            # Otherwise the outcome is genuinely unknown: the transport may have
+            # accepted the message and timed out afterwards. An "uncertain"
+            # receipt is never treated as "not sent" and never re-sent; the
+            # cooldown written above already owns the next attempt.
+            #
+            # This log deliberately carries no exception text and no message
+            # body. Exception type + a fixed reason code + the non-sensitive
+            # operation id are enough to triage a proactive delivery failure.
+            _delivery_finish(chat_id, receipt_key, "uncertain" if delivery_attempted else "failed")
+            print(
+                f"Proactive delivery failed: chat_id={chat_id}, op={receipt_key}, "
+                f"attempted={delivery_attempted}, reason={_reason_code(exc)}, error={type(exc).__name__}",
+                flush=True,
+            )
+            raise
         if sent_as_voice and voice_mode == "auto":
             voice_output.record_auto_voice(runner.memory_pg.set_setting, chat_id)
         sent_at = int(time.time())
@@ -516,6 +668,7 @@ async def _proactive_tick(application):
             print(f"Recent proactive save skipped: {type(exc).__name__}", flush=True)
         runner.bot.histories[chat_id].append({"role": "assistant", "content": text})
         runner.bot.histories[chat_id] = runner.bot.histories[chat_id][-runner.bot.MAX_HISTORY_MESSAGES:]
+        _delivery_finish(chat_id, receipt_key, "success")
         _schedule_from_now(chat_id)
         print(f"Proactive sent: chat_id={chat_id}, type={kind}, silence={state['silence_count']}", flush=True)
 
@@ -523,23 +676,39 @@ async def _proactive_tick(application):
 async def proactive_loop(application):
     await asyncio.sleep(8)
     while True:
+        # Each background job is isolated. A failure in one must not skip the
+        # others in this cycle: a failing proactive tick used to starve the
+        # daily keepsakes and the diary publish step as well.
         try:
             await _proactive_tick(application)
-            chat_id = _owner_chat_id()
-            if chat_id is not None and runner.bot.is_authorized(chat_id):
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"Proactive tick error: reason={_reason_code(exc)}, error={type(exc).__name__}: {_safe_error(exc)}", flush=True)
+
+        chat_id = _owner_chat_id()
+        if chat_id is not None and runner.bot.is_authorized(chat_id):
+            try:
                 import companion_features
                 if os.getenv("MORROW_ONLY") == "1":
                     import morrow_daily
                     await morrow_daily.tick(application, chat_id)
                 else:
                     await companion_features.auto_diary_tick(runner.memory_pg, runner.bot, chat_id)
-                connector = application.bot_data.get('qq_connector')
-                if connector is not None:
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"Daily keepsakes error: reason={_reason_code(exc)}, error={type(exc).__name__}: {_safe_error(exc)}", flush=True)
+
+            connector = application.bot_data.get('qq_connector')
+            if connector is not None:
+                try:
                     await connector.publish_pending_diary()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            print(f"Proactive loop error: {type(exc).__name__}", flush=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    print(f"Diary publish error: reason={_reason_code(exc)}, error={type(exc).__name__}: {_safe_error(exc)}", flush=True)
+
         await asyncio.sleep(30)
 
 
@@ -593,7 +762,12 @@ _original_post_init = runner.post_init
 
 async def post_init_with_proactive(application) -> None:
     await _original_post_init(application)
-    application.create_task(proactive_loop(application))
+    # Idempotence guard: a repeated initialisation must never create a second
+    # proactive loop. The handle is stored under the same bot_data key that
+    # runner_20m.fixed_post_init uses, so whichever entry point runs first wins
+    # and the other becomes a no-op.
+    if "proactive_message_task" not in application.bot_data:
+        application.bot_data["proactive_message_task"] = application.create_task(proactive_loop(application))
     chat_id = _owner_chat_id()
     if chat_id is not None and not _setting(chat_id, KEY_NEXT_AT):
         _schedule_from_now(chat_id)
