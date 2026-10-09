@@ -152,6 +152,36 @@ class FilesystemTests(unittest.TestCase):
         with self.assertRaises(bridge.BridgeError):
             bridge.github_api("/repos/other/other/issues", "FAKE")
 
+    def test_live_issue_revision_must_match_before_execution(self):
+        task = bridge.parse_issue(issue())
+        with patch.object(bridge, "github_api", return_value=issue()):
+            bridge.verify_live_task(task, "FIXTURE")
+        changed = issue(body_text="Do something else")
+        with patch.object(bridge, "github_api", return_value=changed):
+            with self.assertRaises(bridge.BridgeError):
+                bridge.verify_live_task(task, "FIXTURE")
+
+    def test_closed_live_issue_is_revoked(self):
+        task = bridge.parse_issue(issue())
+        closed = issue()
+        closed["state"] = "closed"
+        with patch.object(bridge, "github_api", return_value=closed):
+            with self.assertRaises(bridge.BridgeError):
+                bridge.verify_live_task(task, "FIXTURE")
+
+    def test_cli_never_runs_a_cancelled_remote_task(self):
+        bridge.receive_tasks(self.workspace, "backend", [issue()])
+        closed = issue()
+        closed["state"] = "closed"
+        with patch.object(bridge, "github_token", return_value="FIXTURE"), \
+             patch.object(bridge, "github_api", return_value=closed), \
+             patch.object(bridge, "run_task") as run_mock, \
+             redirect_stderr(io.StringIO()):
+            code = bridge.main(["--workspace", str(self.workspace),
+                                "run", "81", "--approve-local-run"])
+        self.assertEqual(code, 2)
+        run_mock.assert_not_called()
+
     def test_dsh_invocation_is_fixed_argv_no_issue_interpolation(self):
         with patch.object(bridge.shutil, "which", return_value="/bin/dsh"):
             self.assertEqual(
