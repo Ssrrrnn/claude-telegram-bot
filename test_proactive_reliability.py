@@ -282,6 +282,40 @@ class ReceiptTests(unittest.IsolatedAsyncioTestCase):
             await h.app._proactive_tick(h.telegram)
         h.telegram.bot.send_message.assert_not_awaited()
 
+    async def test_production_module_without_receipt_handlers_fails_closed(self):
+        """A real-module-like runner must never send without durable receipts."""
+        h = Harness(with_receipts=False)
+        h.start(self.NOW)
+        self.addCleanup(h.stop)
+        h.app.runner = types.ModuleType("real_runner_double")
+        h.app.runner.memory_pg = types.ModuleType("memory_pg")
+        h.app.runner.memory_pg.get_setting = h.memory.get_setting
+        h.app.runner.memory_pg.set_setting = h.memory.set_setting
+        h.app.runner.memory_pg.save_recent_proactive = h.memory.save_recent_proactive
+        h.app.runner.memory_pg.mutate_continuity = h.memory.mutate_continuity
+        h.app.runner.bot = h.bot
+        h.app.runner._looks_like_emoji_only = lambda text: False
+        with self.assertRaisesRegex(RuntimeError, "Persistent proactive delivery receipt handlers unavailable"):
+            await h.app._proactive_tick(h.telegram)
+        h.telegram.bot.send_message.assert_not_awaited()
+        self.assertEqual(h.saved, [])
+
+    async def test_real_memory_module_missing_finish_handler_fails_closed(self):
+        """Partial receipt support must not authorize a production send."""
+        h = Harness()
+        h.start(self.NOW)
+        self.addCleanup(h.stop)
+        memory_module = types.ModuleType("memory_pg")
+        memory_module.get_setting = h.memory.get_setting
+        memory_module.set_setting = h.memory.set_setting
+        memory_module.save_recent_proactive = h.memory.save_recent_proactive
+        memory_module.mutate_continuity = h.memory.mutate_continuity
+        memory_module.begin_action = h.memory.begin_action
+        h.app.runner.memory_pg = memory_module
+        with self.assertRaisesRegex(RuntimeError, "Persistent proactive delivery receipt handlers unavailable"):
+            await h.app._proactive_tick(h.telegram)
+        h.telegram.bot.send_message.assert_not_awaited()
+
     async def test_cancellation_records_uncertain_and_propagates(self):
         self.h.telegram.bot.send_message.side_effect = asyncio.CancelledError()
         with self.assertRaises(asyncio.CancelledError):
@@ -492,6 +526,31 @@ class LogSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reason=runtime", logged)
         self.assertIn("error=RuntimeError", logged)
         self.assertIn("op=proactive:", logged)
+
+    async def test_background_loop_logs_only_fixed_error_codes(self):
+        """A background exception carrying unknown credentials must not leak."""
+        h = self.h
+        injected = "UNRECOGNIZED_SECRET_FORMAT_FIXTURE"
+        async def boom(*args):
+            raise RuntimeError("diagnostic " + injected + " private message body")
+        sleeps = {"count": 0}
+        async def one_cycle(_):
+            sleeps["count"] += 1
+            if sleeps["count"] > 1:
+                raise asyncio.CancelledError()
+        buffer = io.StringIO()
+        with patch.object(h.app, "_proactive_tick", side_effect=boom), \
+             patch.dict(os.environ, {"MORROW_ONLY": "0"}), \
+             patch("companion_features.auto_diary_tick", side_effect=RuntimeError(injected)), \
+             patch.object(h.app.asyncio, "sleep", side_effect=one_cycle), \
+             contextlib.redirect_stdout(buffer):
+            with self.assertRaises(asyncio.CancelledError):
+                await h.app.proactive_loop(h.telegram)
+        logged = buffer.getvalue()
+        self.assertNotIn(injected, logged)
+        self.assertNotIn("private message body", logged)
+        self.assertIn("Proactive tick error: reason=runtime, error=RuntimeError", logged)
+        self.assertIn("Daily keepsakes error: reason=runtime, error=RuntimeError", logged)
 
     def test_safe_error_redacts_several_credential_shapes(self):
         cases = (
